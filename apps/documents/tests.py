@@ -7,16 +7,21 @@ from io import BytesIO
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from rest_framework.test import (
+    APIClient,
+    APITestCase,
+)
 import numpy as np
 
 from django.conf import settings
 from django.core.files.storage import default_storage
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
-from django.test import TestCase, override_settings
+from django.test import (
+    TestCase,
+    override_settings)
 from docx import Document as DocxDocument
 from rest_framework import status
-from rest_framework.test import APIClient
 
 from .models import Document, DocumentChunk
 from .services import (
@@ -1070,11 +1075,16 @@ class DocumentServiceTests(
         )
 
 
-class DocumentAPITests(
-    DocumentTestMixin,
-    TemporaryMediaMixin,
-    TestCase,
-):
+
+@override_settings(
+    MEDIA_ROOT="/tmp/doc_qa_api_media",
+)
+class DocumentAPITests(APITestCase):
+# class DocumentAPITests(
+#     DocumentTestMixin,
+#     TemporaryMediaMixin,
+#     TestCase,
+# ):
     @classmethod
     def setUpClass(cls):
         cls._media_root = Path(

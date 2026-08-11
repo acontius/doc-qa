@@ -454,147 +454,162 @@ def _replace_chunks(
 def create_document(
     *,
     title: str,
-    uploaded_file: BinaryIO,
+    uploaded_file,
 ) -> Document:
-    """
-    Create a document and its complete ingestion state atomically.
-    """
-    prepared = prepare_document(
-        uploaded_file,
-    )
+    validate_docx_upload(uploaded_file)
 
-    uploaded_file.seek(0)
-
-    document = Document(
-        title=title.strip(),
-        full_text=prepared.full_text,
-        chunk_count=len(prepared.chunks),
-        embedding_model=prepared.embedding_model,
-    )
+    document = None
+    saved_file_name = None
 
     try:
         with transaction.atomic():
+            document = Document(
+                title=title,
+                embedding_model=settings.EMBEDDING_MODEL,
+            )
+
             document.file.save(
-                "document.docx",
+                uploaded_file.name,
                 uploaded_file,
                 save=False,
             )
 
+            saved_file_name = document.file.name
+
+            full_text = extract_docx_text(
+                document.file,
+            )
+
+            chunks = chunk_text(full_text)
+
+            embeddings = embedding_service.embed_documents(
+                chunks,
+            )
+
+            document.full_text = full_text
+            document.chunk_count = len(chunks)
+
             document.save()
 
-            _replace_chunks(
-                document,
-                prepared,
+            DocumentChunk.objects.bulk_create(
+                [
+                    DocumentChunk(
+                        document=document,
+                        chunk_index=index,
+                        text=text,
+                        embedding=embedding,
+                    )
+                    for index, (text, embedding)
+                    in enumerate(zip(chunks, embeddings))
+                ]
             )
 
     except Exception:
-        if document.file.name:
-            default_storage.delete(
-                document.file.name,
-            )
+        if saved_file_name:
+            try:
+                default_storage.delete(saved_file_name)
+            except Exception:
+                logger.exception(
+                    "Failed to clean up uploaded file after rollback",
+                )
 
         raise
 
     return document
 
 
+
 def update_document(
     document: Document,
     *,
     title: str,
-    uploaded_file: BinaryIO | None = None,
+    uploaded_file=None,
 ) -> Document:
-    """
-    Update document metadata or replace its source and index.
-    """
     if uploaded_file is None:
-        with transaction.atomic():
-            document.title = title.strip()
-
-            document.save(
-                update_fields=[
-                    "title",
-                    "updated_at",
-                ]
-            )
-
+        document.title = title
+        document.save(
+            update_fields=[
+                "title",
+                "updated_at",
+            ],
+        )
         return document
 
-    prepared = prepare_document(
-        uploaded_file,
-    )
+    validate_docx_upload(uploaded_file)
 
-    uploaded_file.seek(0)
-
-    locked_document: Document | None = None
-    old_file_name: str | None = None
-    new_file_name: str | None = None
+    old_file_name = document.file.name
+    new_file_name = None
 
     try:
         with transaction.atomic():
-            locked_document = (
-                Document.objects
-                .select_for_update()
-                .get(pk=document.pk)
-            )
+            document.title = title
 
-            old_file_name = (
-                locked_document.file.name
-            )
-
-            locked_document.file.save(
-                "document.docx",
+            document.file.save(
+                uploaded_file.name,
                 uploaded_file,
                 save=False,
             )
 
-            new_file_name = (
-                locked_document.file.name
+            new_file_name = document.file.name
+
+            full_text = extract_docx_text(
+                document.file,
             )
 
-            locked_document.title = title.strip()
-            locked_document.full_text = (
-                prepared.full_text
-            )
-            locked_document.chunk_count = (
-                len(prepared.chunks)
-            )
-            locked_document.embedding_model = (
-                prepared.embedding_model
+            chunks = chunk_text(full_text)
+
+            embeddings = embedding_service.embed_documents(
+                chunks,
             )
 
-            locked_document.save()
+            document.full_text = full_text
+            document.chunk_count = len(chunks)
+            document.embedding_model = settings.EMBEDDING_MODEL
 
-            _replace_chunks(
-                locked_document,
-                prepared,
+            document.save()
+
+            document.chunks.all().delete()
+
+            DocumentChunk.objects.bulk_create(
+                [
+                    DocumentChunk(
+                        document=document,
+                        chunk_index=index,
+                        text=text,
+                        embedding=embedding,
+                    )
+                    for index, (text, embedding)
+                    in enumerate(zip(chunks, embeddings))
+                ]
             )
-
-            if (
-                old_file_name
-                and old_file_name != new_file_name
-            ):
-                transaction.on_commit(
-                    lambda name=old_file_name: (
-                        default_storage.delete(name)
-                    ),
-                    robust=True,
-                )
 
     except Exception:
-        if (
-            locked_document is not None
-            and new_file_name
-            and new_file_name != old_file_name
-        ):
-            default_storage.delete(
-                new_file_name,
-            )
+        if new_file_name:
+            try:
+                default_storage.delete(new_file_name)
+            except Exception:
+                logger.exception(
+                    "Failed to clean up replacement file after rollback",
+                )
 
         raise
 
-    return locked_document
+    if (
+        old_file_name
+        and old_file_name != new_file_name
+    ):
+        try:
+            default_storage.delete(old_file_name)
+        except Exception:
+            logger.exception(
+                "Failed to delete old document file",
+                extra={
+                    "file_name": old_file_name,
+                },
+            )
+            raise
 
+    return document
 
 def reindex_document(
     document: Document,
@@ -647,21 +662,20 @@ def reindex_document(
     return locked_document
 
 
-def delete_document(
-    document: Document,
-) -> None:
-    """
-    Delete the database object and its stored file safely.
-    """
-    old_file_name = document.file.name
+def delete_document(document: Document) -> None:
+    file_name = document.file.name if document.file else None
 
     with transaction.atomic():
         document.delete()
 
-        if old_file_name:
-            transaction.on_commit(
-                lambda name=old_file_name: (
-                    default_storage.delete(name)
-                ),
-                robust=True,
+    if file_name:
+        try:
+            default_storage.delete(file_name)
+        except Exception:
+            logger.exception(
+                "Failed to delete document file",
+                extra={
+                    "file_name": file_name,
+                },
             )
+            raise
