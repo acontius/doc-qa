@@ -3,7 +3,7 @@ Django==5.2.16
 djangorestframework==3.17.1
 drf-spectacular==0.30.0
 
-# DB Requirements
+# Database
 psycopg[binary]==3.3.4
 pgvector==0.5.0
 
@@ -12,9 +12,13 @@ langchain==1.3.14
 langchain-openai==1.4.0
 langchain-text-splitters==1.1.2
 
-# Input Scan
-python-docx==1.2.0
+# Embeddings & ML
 sentence-transformers==5.6.0
+
+# Document Processing
+python-docx==1.2.0
+
+# Configuration
 python-dotenv==1.2.2
 
 # Server
