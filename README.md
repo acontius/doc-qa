@@ -89,4 +89,155 @@ the last one is [admin](https://my-domain:my-port/admin) which you may login whi
 #### END OF Milestone1-Infrastructure
 ---
 
-### Welcome to second Milestone-Document Management
+### Welcome to second Milestone-Document Ingestion Subsystem
+**at the end of this milestone we shall**:
+```http
+POST   /api/documents/
+GET    /api/documents/
+GET    /api/documents/{id}/
+PATCH  /api/documents/{id}/
+DELETE /api/documents/{id}/
+POST   /api/documents/{id}/reindex/
+```
+Upload a file(.docx) and save it to Database.
+```tree
+Document
+├── title
+├── file
+├── full_text
+├── chunk_count
+└── embedding_model
+
+DocumentChunk
+├── document
+├── chunk_index
+├── text
+└── embedding[384]
+```
+
+my choises are : 
+- Docx Parser 
+    - python-docx 
+        - because we only have docx and there is no need for extra dependecies.
+
+- Chunking 
+    - RecursiveCharacterTextSplitter\
+        - cause it tries to split meaningful
+    - chunk_size=1000
+        - don't want chunks to be so big so each chunk contains multi subjects and neither want it to be so small so the context split too much.
+    - chunk_overlap=200
+        - 20% overlap is OK i thought
+
+- Embedding
+    - sentence-transformers
+    - paraphrase-multilingual-MiniLM-L12-v2
+        - Supportss Persian
+    - 384 dimensions(because of the model)
+
+- Vector DB 
+    - PostgreSQL + pgvector
+        - Cause it came for postgres to solve the saving embeding problem.
+    
+
+
+the whole pipeline is somthing like :
+```
+                    DOCX
+                     │
+                     ▼
+              Upload validation
+                     │
+          ┌──────────┴──────────┐
+          │                     │
+       size/type             valid DOCX?
+          │                     │
+          └──────────┬──────────┘
+                     ▼
+              DOCX extraction
+                     │
+          paragraphs + tables
+                     │
+                     ▼
+              normalized text
+                     │
+                     ▼
+               full_text
+                     │
+                     ▼
+        RecursiveCharacterTextSplitter
+                     │
+                     ▼
+                  chunks
+                     │
+                     ▼
+          SentenceTransformer
+                     │
+                     ▼
+             384-dim vectors
+                     │
+                     ▼
+              PostgreSQL
+                 + pgvector
+                     │
+             ┌───────┴───────┐
+             ▼               ▼
+          Document      DocumentChunk
+```
+
+```
+Document → Extraction → Chunk → Embedding → pgvector
+```
+
+view shall not do : 
+- extract
+- chunk
+- embed
+- save
+- and ...
+
+it must just go for :
+validating request -> call servieces -> return response
+                      
+                            ^
+                            | 
+                      
+                      prepare document
+                      
+                      save document
+                      
+                      replace chunks
+                      
+                      delete old file
+
+we are going to save docs with UUID or our valid names to reduce `conflicts` and `file upload` attack vulnerability.
+
+something like : `documents/2026/08/1234...4321.docs`
+
+<font color=red size=6>BUT</font>
+we wont stick only to that and will try to check i multiple time. even  checking extension is not enougth cause `attacker.php.docx` is still a docx and still vulnerable.
+
+so :
+```
+extension check
+        +
+size check
+        +
+ZIP/OOXML structure
+        +
+python-docx parsing
+```
+
+What we have done till this commit is :
+```
+M2-A  Document model + migrations       ✅
+M2-B  DOCX validation                   ✅
+M2-C  DOCX extraction                   ✅
+M2-D  Chunking                          ✅
+M2-E  Embedding service                  ← NEXT
+M2-F  pgvector storage                   ←
+M2-G  Reindex lifecycle                  ←
+M2-H  Retrieval                          ←
+M2-I  API hardening                      ←
+M2-J  Integration tests                  ←
+```
+
