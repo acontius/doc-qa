@@ -198,16 +198,16 @@ view shall not do :
 it must just go for :
 validating request -> call servieces -> return response
                       
-                            ^
-                            | 
-                      
-                      prepare document
-                      
-                      save document
-                      
-                      replace chunks
-                      
-                      delete old file
+                                        ^
+                                        | 
+                                
+                                prepare document
+                                
+                                save document
+                                
+                                replace chunks
+                                
+                                delete old file
 
 we are going to save docs with UUID or our valid names to reduce `conflicts` and `file upload` attack vulnerability.
 
