@@ -42,14 +42,21 @@ ALLOWED_HOSTS = env_list(
 
 
 INSTALLED_APPS = [
+    # Django apps
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "django.contrib.postgres",
+
+    # Third party
     "rest_framework",
     "drf_spectacular",
+    
+    # Project apps
+    "apps.documents",
 ]
 
 
@@ -216,3 +223,6 @@ RETRIEVER_CANDIDATE_MULTIPLIER = int(
 MAX_UPLOAD_SIZE_MB = int(
     os.getenv("MAX_UPLOAD_SIZE_MB", "10")
 )
+
+MEDIA_ROOT = BASE_DIR / "media"
+MEDIA_URL = "/media/"
