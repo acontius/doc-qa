@@ -21,10 +21,14 @@ from .serializers import (
     DocumentWriteSerializer,
     RetrievalRequestSerializer,
     RetrievalResponseSerializer,
+    QuestionRequestSerializer,
+    QuestionResponseSerializer,
 )
 from .services import (
     DocumentIngestionError,
     DocumentRetrievalError,
+    RAGError,
+    answer_question,
     create_document,
     delete_document,
     reindex_document,
@@ -425,3 +429,86 @@ class RetrievalView(APIView):
         }
 
         return Response(payload, status=status.HTTP_200_OK)
+
+
+
+class QuestionView(APIView):
+    """
+    Grounded document Q&A using retrieval + OpenRouter LLM.
+    """
+
+    @extend_schema(
+        summary="Ask a grounded question",
+        description=(
+            "Retrieve relevant chunks, build controlled context, "
+            "call the configured LLM, and return answer + sources. "
+            "Does not invent facts outside retrieved documents."
+        ),
+        request=QuestionRequestSerializer,
+        responses={200: QuestionResponseSerializer},
+    )
+    def post(self, request, *args, **kwargs):
+        serializer = QuestionRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        data = serializer.validated_data
+
+        try:
+            result = answer_question(
+                data["question"],
+                top_k=data.get("top_k"),
+                document_ids=data.get("document_ids"),
+            )
+        except (DocumentRetrievalError, DocumentIngestionError, RAGError) as exc:
+            code = getattr(exc, "code", "qa_error")
+            status_code = status.HTTP_400_BAD_REQUEST
+            if code in {
+                "llm_not_configured",
+                "llm_init_failed",
+                "llm_request_failed",
+                "llm_empty_response",
+            }:
+                status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return Response(
+                {
+                    "error": {
+                        "code": code,
+                        "message": getattr(
+                            exc,
+                            "message",
+                            str(exc),
+                        ),
+                    }
+                },
+                status=status_code,
+            )
+        except Exception:
+            logger.exception("Unexpected QA failure")
+            return Response(
+                {
+                    "error": {
+                        "code": "qa_failed",
+                        "message": "پاسخ‌گویی با خطا مواجه شد.",
+                    }
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        payload = {
+            "question": result.question,
+            "answer": result.answer,
+            "sources": [
+                {
+                    "document_id": src.document_id,
+                    "document_title": src.document_title,
+                    "chunk_index": src.chunk_index,
+                    "excerpt": src.excerpt,
+                }
+                for src in result.sources
+            ],
+            "confidence": result.confidence,
+            "latency_ms": result.latency_ms,
+        }
+
+        return Response(payload, status=status.HTTP_200_OK)
+

@@ -142,3 +142,46 @@ class RetrievedChunkSerializer(serializers.Serializer):
 class RetrievalResponseSerializer(serializers.Serializer):
     question = serializers.CharField()
     results = RetrievedChunkSerializer(many=True)
+
+
+class QuestionRequestSerializer(serializers.Serializer):
+    question = serializers.CharField(
+        allow_blank=False,
+        trim_whitespace=True,
+    )
+    top_k = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        max_value=50,
+    )
+    document_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        required=False,
+        allow_empty=False,
+    )
+
+    def validate_question(self, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError(
+                "سؤال نمی‌تواند خالی باشد."
+            )
+        return value
+
+
+class AnswerSourceSerializer(serializers.Serializer):
+    document_id = serializers.IntegerField()
+    document_title = serializers.CharField()
+    chunk_index = serializers.IntegerField()
+    excerpt = serializers.CharField()
+
+
+class QuestionResponseSerializer(serializers.Serializer):
+    question = serializers.CharField()
+    answer = serializers.CharField()
+    sources = AnswerSourceSerializer(many=True)
+    confidence = serializers.ChoiceField(
+        choices=["low", "medium", "high"],
+    )
+    latency_ms = serializers.IntegerField()
+

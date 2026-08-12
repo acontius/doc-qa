@@ -42,6 +42,14 @@ from .services import (
     tokenize_text,
     update_document,
     validate_docx_upload,
+    answer_question,
+    build_rag_context,
+    get_chat_model,
+    is_llm_configured,
+    parse_llm_response,
+    NO_CONTEXT_ANSWER,
+    RAGError,
+    RetrievedChunk,
 )
 
 
@@ -1858,3 +1866,313 @@ class RetrievalAPITests(
             self.assertIn("document_id", first)
             self.assertIn("final_score", first)
             self.assertIn("text", first)
+
+
+
+class RAGContextTests(TestCase):
+    def test_build_context_includes_metadata(self):
+        chunks = [
+            RetrievedChunk(
+                document_id=1,
+                document_title="Policy",
+                chunk_index=0,
+                text="مرخصی بیست روز است.",
+                distance=0.1,
+                vector_score=0.9,
+                keyword_score=0.5,
+                final_score=0.78,
+            )
+        ]
+        context = build_rag_context(chunks)
+        self.assertIn("document_id: 1", context)
+        self.assertIn("document_title: Policy", context)
+        self.assertIn("chunk_index: 0", context)
+        self.assertIn("مرخصی بیست روز است.", context)
+        self.assertNotIn("embedding", context.lower())
+
+    def test_parse_valid_json(self):
+        chunks = [
+            RetrievedChunk(
+                document_id=4,
+                document_title="Company Policy",
+                chunk_index=3,
+                text="مدت قرارداد یک سال است.",
+                distance=0.2,
+                vector_score=0.8,
+                keyword_score=0.4,
+                final_score=0.68,
+            )
+        ]
+        raw = (
+            '{"answer": "یک سال", "sources": [{"document_id": 4, '
+            '"document_title": "Company Policy", "chunk_index": 3, '
+            '"excerpt": "مدت قرارداد یک سال است."}], "confidence": "high"}'
+        )
+        answer, sources, confidence = parse_llm_response(raw, chunks)
+        self.assertEqual(answer, "یک سال")
+        self.assertEqual(confidence, "high")
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0].document_id, 4)
+        self.assertLessEqual(len(sources[0].excerpt), 250)
+
+    def test_parse_markdown_json(self):
+        chunks = [
+            RetrievedChunk(
+                document_id=1,
+                document_title="A",
+                chunk_index=0,
+                text="hello world",
+                distance=0.1,
+                vector_score=0.9,
+                keyword_score=0.1,
+                final_score=0.66,
+            )
+        ]
+        raw = '```json\n{"answer": "hello", "sources": [], "confidence": "medium"}\n```'
+        answer, sources, confidence = parse_llm_response(raw, chunks)
+        self.assertEqual(answer, "hello")
+        self.assertEqual(confidence, "medium")
+        self.assertEqual(sources, [])
+
+    def test_parse_invalid_json_fallback(self):
+        chunks = []
+        raw = "this is not json at all"
+        answer, sources, confidence = parse_llm_response(raw, chunks)
+        self.assertEqual(answer, raw)
+        self.assertEqual(sources, [])
+        self.assertEqual(confidence, "low")
+
+    def test_invalid_confidence_becomes_low(self):
+        chunks = []
+        raw = '{"answer": "x", "sources": [], "confidence": "extreme"}'
+        answer, sources, confidence = parse_llm_response(raw, chunks)
+        self.assertEqual(confidence, "low")
+
+    def test_invented_source_rejected(self):
+        chunks = [
+            RetrievedChunk(
+                document_id=1,
+                document_title="A",
+                chunk_index=0,
+                text="real text",
+                distance=0.1,
+                vector_score=0.9,
+                keyword_score=0.2,
+                final_score=0.69,
+            )
+        ]
+        raw = (
+            '{"answer": "x", "sources": [{"document_id": 999, '
+            '"document_title": "Fake", "chunk_index": 0, '
+            '"excerpt": "nope"}], "confidence": "high"}'
+        )
+        answer, sources, confidence = parse_llm_response(raw, chunks)
+        self.assertEqual(sources, [])
+
+
+class LLMConfigTests(TestCase):
+    def tearDown(self):
+        get_chat_model.cache_clear()
+        super().tearDown()
+
+    @override_settings(OPENROUTER_API_KEY="", OPENROUTER_MODEL="")
+    def test_not_configured(self):
+        self.assertFalse(is_llm_configured())
+
+    @override_settings(
+        OPENROUTER_API_KEY="test-key",
+        OPENROUTER_MODEL="test-model",
+    )
+    def test_configured(self):
+        self.assertTrue(is_llm_configured())
+
+    @override_settings(OPENROUTER_API_KEY="", OPENROUTER_MODEL="m")
+    def test_get_chat_model_missing_key(self):
+        get_chat_model.cache_clear()
+        with self.assertRaises(RAGError) as ctx:
+            get_chat_model()
+        self.assertEqual(ctx.exception.code, "llm_not_configured")
+
+
+class QAServiceTests(
+    DocumentTestMixin,
+    TemporaryMediaMixin,
+    TestCase,
+):
+    def tearDown(self):
+        get_chat_model.cache_clear()
+        super().tearDown()
+
+    def _create_chunk_document(self, title, text, value=0.01):
+        with self.mocked_embedding_service(value=value):
+            content = self.make_docx(paragraphs=[text * 15])
+            return create_document(
+                title=title,
+                uploaded_file=self.make_upload(content),
+            )
+
+    def test_no_context_does_not_call_llm(self):
+        with self.mocked_embedding_service(value=0.02):
+            with patch(
+                "apps.documents.services.get_chat_model",
+            ) as mock_get:
+                result = answer_question(
+                    "سؤالی که هیچ سندی ندارد",
+                    top_k=3,
+                )
+
+        mock_get.assert_not_called()
+        self.assertEqual(result.answer, NO_CONTEXT_ANSWER)
+        self.assertEqual(result.sources, [])
+        self.assertEqual(result.confidence, "low")
+
+    def test_successful_qa(self):
+        self._create_chunk_document(
+            "Leave",
+            "مرخصی کارکنان سالانه بیست روز است.",
+        )
+
+        mock_model = Mock()
+        mock_response = Mock()
+        mock_response.content = (
+            '{"answer": "بیست روز", "sources": [{"document_id": 1, '
+            '"document_title": "Leave", "chunk_index": 0, '
+            '"excerpt": "مرخصی کارکنان سالانه بیست روز است."}], '
+            '"confidence": "high"}'
+        )
+        mock_model.invoke.return_value = mock_response
+
+        with self.mocked_embedding_service(value=0.02):
+            with patch(
+                "apps.documents.services.get_chat_model",
+                return_value=mock_model,
+            ):
+                # Fix document_id in JSON dynamically after create
+                doc = Document.objects.get(title="Leave")
+                mock_response.content = (
+                    '{"answer": "بیست روز", "sources": [{'
+                    f'"document_id": {doc.id}, '
+                    '"document_title": "Leave", "chunk_index": 0, '
+                    '"excerpt": "مرخصی کارکنان سالانه بیست روز است."'
+                    '}], "confidence": "high"}'
+                )
+                result = answer_question(
+                    "میزان مرخصی سالانه چقدر است؟",
+                    top_k=3,
+                )
+
+        self.assertEqual(result.answer, "بیست روز")
+        self.assertEqual(result.confidence, "high")
+        self.assertTrue(result.sources)
+        self.assertEqual(result.sources[0].document_id, doc.id)
+        mock_model.invoke.assert_called_once()
+
+    def test_llm_failure_raises_rag_error(self):
+        self._create_chunk_document(
+            "X",
+            "متن نمونه برای خطا.",
+        )
+        mock_model = Mock()
+        mock_model.invoke.side_effect = RuntimeError("timeout")
+
+        with self.mocked_embedding_service(value=0.02):
+            with patch(
+                "apps.documents.services.get_chat_model",
+                return_value=mock_model,
+            ):
+                with self.assertRaises(RAGError) as ctx:
+                    answer_question("متن نمونه چیست؟", top_k=2)
+
+        self.assertEqual(ctx.exception.code, "llm_request_failed")
+
+
+class QuestionAPITests(
+    DocumentTestMixin,
+    TemporaryMediaMixin,
+    APITestCase,
+):
+    def setUp(self):
+        self.client = APIClient()
+
+    def tearDown(self):
+        get_chat_model.cache_clear()
+        super().tearDown()
+
+    def test_question_endpoint_no_context(self):
+        with self.mocked_embedding_service(value=0.02):
+            with patch(
+                "apps.documents.services.get_chat_model",
+            ) as mock_get:
+                response = self.client.post(
+                    "/api/questions/",
+                    {"question": "چیزی که در دیتابیس نیست"},
+                    format="json",
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["answer"],
+            NO_CONTEXT_ANSWER,
+        )
+        self.assertEqual(response.data["sources"], [])
+        self.assertEqual(response.data["confidence"], "low")
+        mock_get.assert_not_called()
+
+    def test_question_endpoint_success(self):
+        with self.mocked_embedding_service(value=0.02):
+            content = self.make_docx(
+                paragraphs=[
+                    "ساعات کاری از هشت تا چهار است. " * 20,
+                ],
+            )
+            create_response = self.client.post(
+                "/api/documents/",
+                {
+                    "title": "Hours",
+                    "file": self.make_upload(content),
+                },
+                format="multipart",
+            )
+            doc_id = create_response.data["id"]
+
+            mock_model = Mock()
+            mock_response = Mock()
+            mock_response.content = (
+                '{"answer": "از هشت تا چهار", "sources": [{'
+                f'"document_id": {doc_id}, '
+                '"document_title": "Hours", "chunk_index": 0, '
+                '"excerpt": "ساعات کاری از هشت تا چهار است."'
+                '}], "confidence": "medium"}'
+            )
+            mock_model.invoke.return_value = mock_response
+
+            with patch(
+                "apps.documents.services.get_chat_model",
+                return_value=mock_model,
+            ):
+                response = self.client.post(
+                    "/api/questions/",
+                    {
+                        "question": "ساعات کاری چیست؟",
+                        "top_k": 3,
+                    },
+                    format="json",
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["answer"], "از هشت تا چهار")
+        self.assertEqual(response.data["confidence"], "medium")
+        self.assertIn("latency_ms", response.data)
+        self.assertTrue(response.data["sources"])
+
+    def test_question_rejects_empty(self):
+        response = self.client.post(
+            "/api/questions/",
+            {"question": "  "},
+            format="json",
+        )
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
