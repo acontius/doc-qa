@@ -5,14 +5,13 @@
 For this project we have 9 Milestones. at least till now. i dont know what am i going to do in next few minutes **:)**.
 list of milestones :
 1) Infrastructure
-2) Document Management
-3) Chunking & Embeddings
-4) Retrieval
-5) LLM / RAG
-6) Question History
-7) Complete API & Documentation
-8) Tests & Sample Data
-9) Finalization
+2) Document Ingestion Subsystem
+3) Retrieval
+4) LLM / RAG
+5) Question History
+6) Complete API & Documentation
+7) Tests & Sample Data
+8) Finalization
 
 
 ### so why are they so many ? 
@@ -142,46 +141,33 @@ my choises are :
 
 the whole pipeline is somthing like :
 ```
-                    DOCX
+                DOCUMENT MANAGEMENT
+                       │
+          ┌────────────┴────────────┐
+          │                         │
+       Storage                  Processing
+          │                         │
+       Document                 DOCX
+          │                         │
+          │                    Extraction
+          │                         │
+          │                      Chunking
+          │                         │
+          │                     Embedding
+          │                         │
+          └──────────┬──────────────┘
                      │
-                     ▼
-              Upload validation
+                 PostgreSQL
+                     +
+                  pgvector
                      │
-          ┌──────────┴──────────┐
-          │                     │
-       size/type             valid DOCX?
-          │                     │
-          └──────────┬──────────┘
-                     ▼
-              DOCX extraction
+          ┌──────────┼──────────┐
+          │          │          │
+        Create     Update     Reindex
+          │          │          │
+          └──────────┼──────────┘
                      │
-          paragraphs + tables
-                     │
-                     ▼
-              normalized text
-                     │
-                     ▼
-               full_text
-                     │
-                     ▼
-        RecursiveCharacterTextSplitter
-                     │
-                     ▼
-                  chunks
-                     │
-                     ▼
-          SentenceTransformer
-                     │
-                     ▼
-             384-dim vectors
-                     │
-                     ▼
-              PostgreSQL
-                 + pgvector
-                     │
-             ┌───────┴───────┐
-             ▼               ▼
-          Document      DocumentChunk
+                   Delete
 ```
 
 ```
@@ -233,11 +219,19 @@ M2-A  Document model + migrations       ✅
 M2-B  DOCX validation                   ✅
 M2-C  DOCX extraction                   ✅
 M2-D  Chunking                          ✅
-M2-E  Embedding service                  ← NEXT
-M2-F  pgvector storage                   ←
-M2-G  Reindex lifecycle                  ←
-M2-H  Retrieval                          ←
-M2-I  API hardening                      ←
-M2-J  Integration tests                  ←
+M2-E  Embedding service                 ✅
+M2-F  pgvector storage                  ✅
+M2-G  Reindex lifecycle                 ✅
 ```
 
+we now have :
+```
+      Action       |              Behavior
+Create             |     Validate, extract, chunk, embed, store Document + chunks + file
+PATCH title only   |     Updates title, does not reindex
+PATCH with file    |     Re-extract, re-chunk, re-embed, replace chunks, remove old file
+Reindex            |     Rebuild from existing file on disk
+Delete             |     Remove DB rows + uploaded file
+Failure mid-ingest |     DB rolled back + uploaded file cleaned up
+```
+The last failure was a test bug: earlier tests left files on disk (Django rolls back DB, not files). The assertion expected an empty media folder. That is fixed.

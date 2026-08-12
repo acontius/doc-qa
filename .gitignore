@@ -1,0 +1,12 @@
+# Sensitive information 
+doc-qa/.env
+./.env
+.env
+
+# Locale information 
+media/
+doc-qa/roshan/assets
+*.png
+*.jpg
+*.jpeg
+roshan/.obsidian/
