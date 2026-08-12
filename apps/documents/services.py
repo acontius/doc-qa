@@ -18,6 +18,8 @@ from docx.text.paragraph import Paragraph
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 
+from pgvector.django import CosineDistance
+
 from .models import Document, DocumentChunk
 
 logger = logging.getLogger(__name__)
@@ -677,3 +679,246 @@ def delete_document(document: Document) -> None:
 
     if file_name:
         _delete_stored_file(file_name, full_path)
+
+
+
+class DocumentRetrievalError(DocumentIngestionError):
+    """Raised when retrieval cannot be completed."""
+
+
+@dataclass(frozen=True)
+class RetrievedChunk:
+    document_id: int
+    document_title: str
+    chunk_index: int
+    text: str
+    distance: float
+    vector_score: float
+    keyword_score: float
+    final_score: float
+
+
+_MAX_TOP_K = 50
+
+
+def _normalize_persian_chars(text: str) -> str:
+    """Normalize common Arabic/Persian character variants."""
+    return (
+        text
+        .replace("\u064a", "\u06cc")  # ي → ی
+        .replace("\u0643", "\u06a9")  # ك → ک
+        .replace("\u0629", "\u0647")  # ة → ه
+        .replace("\u0624", "\u0648")  # ؤ → و
+        .replace("\u0625", "\u0627")  # إ → ا
+        .replace("\u0623", "\u0627")  # أ → ا
+        .replace("\u0622", "\u0627")  # آ → ا
+    )
+
+
+def tokenize_text(text: str) -> list[str]:
+    """
+    Simple Unicode-aware tokenizer for Persian and English.
+    """
+    if not text:
+        return []
+
+    text = unicodedata.normalize("NFC", text)
+    text = _normalize_persian_chars(text)
+    text = text.casefold()
+
+    tokens: list[str] = []
+    current: list[str] = []
+
+    for char in text:
+        # Skip zero-width non-joiner/joiner inside tokens
+        if char in {"\u200c", "\u200d"}:
+            continue
+        if char.isalnum():
+            current.append(char)
+        else:
+            if current:
+                token = "".join(current)
+                if token:
+                    tokens.append(token)
+                current = []
+
+    if current:
+        token = "".join(current)
+        if token:
+            tokens.append(token)
+
+    return tokens
+
+
+def compute_keyword_score(question: str, chunk_text: str) -> float:
+    """
+    keyword_score = overlap / max(1, len(question_terms))
+    """
+    question_terms = tokenize_text(question)
+    if not question_terms:
+        return 0.0
+
+    chunk_terms = set(tokenize_text(chunk_text))
+    overlap = sum(1 for term in question_terms if term in chunk_terms)
+
+    return overlap / max(1, len(question_terms))
+
+
+def compute_vector_score(distance: float) -> float:
+    """vector_score = 1 / (1 + distance)"""
+    return 1.0 / (1.0 + float(distance))
+
+
+def _validate_retrieval_inputs(
+    question: str,
+    top_k: int | None,
+    document_ids: list[int] | None,
+) -> tuple[str, int, list[int] | None]:
+    if not isinstance(question, str):
+        raise DocumentRetrievalError(
+            "سوال باید متن باشد.",
+            "invalid_question",
+        )
+
+    question = question.strip()
+    if not question:
+        raise DocumentRetrievalError(
+            "سوال نمی‌تواند خالی باشد.",
+            "empty_question",
+        )
+
+    if top_k is None:
+        top_k = settings.RETRIEVER_TOP_K
+
+    if not isinstance(top_k, int) or isinstance(top_k, bool):
+        raise DocumentRetrievalError(
+            "مقدار top_k باید عدد صحیح باشد.",
+            "invalid_top_k",
+        )
+
+    if top_k <= 0:
+        raise DocumentRetrievalError(
+            "مقدار top_k باید بزرگ‌تر از صفر باشد.",
+            "invalid_top_k",
+        )
+
+    if top_k > _MAX_TOP_K:
+        raise DocumentRetrievalError(
+            f"مقدار top_k نمی‌تواند بیشتر از {_MAX_TOP_K} باشد.",
+            "invalid_top_k",
+        )
+
+    if document_ids is not None:
+        if not isinstance(document_ids, list):
+            raise DocumentRetrievalError(
+                "شناسه اسناد باید به صورت لیست ارسال شود.",
+                "invalid_document_ids",
+            )
+
+        if len(document_ids) == 0:
+            raise DocumentRetrievalError(
+                "لیست شناسه اسناد نمی‌تواند خالی باشد.",
+                "empty_document_ids",
+            )
+
+        cleaned_ids: list[int] = []
+        for item in document_ids:
+            if (
+                not isinstance(item, int)
+                or isinstance(item, bool)
+                or item <= 0
+            ):
+                raise DocumentRetrievalError(
+                    "شناسه اسناد نامعتبر است.",
+                    "invalid_document_ids",
+                )
+            cleaned_ids.append(item)
+
+        document_ids = cleaned_ids
+
+    return question, top_k, document_ids
+
+
+def retrieve_chunks(
+    question: str,
+    *,
+    top_k: int | None = None,
+    document_ids: list[int] | None = None,
+) -> list[RetrievedChunk]:
+    """
+    Hybrid retrieval:
+
+    question → embed → pgvector candidates → keyword score → hybrid rank → top_k
+    """
+    question, top_k, document_ids = _validate_retrieval_inputs(
+        question,
+        top_k,
+        document_ids,
+    )
+
+    candidate_multiplier = settings.RETRIEVER_CANDIDATE_MULTIPLIER
+    if candidate_multiplier < 1:
+        candidate_multiplier = 1
+
+    candidate_count = top_k * candidate_multiplier
+
+    embeddings = get_embedding_service().embed_documents([question])
+    if not embeddings:
+        raise DocumentRetrievalError(
+            "تولید embedding برای سوال با خطا مواجه شد.",
+            "question_embedding_failed",
+        )
+
+    question_embedding = embeddings[0]
+
+    queryset = DocumentChunk.objects.select_related("document")
+
+    if document_ids is not None:
+        queryset = queryset.filter(document_id__in=document_ids)
+
+    queryset = (
+        queryset
+        .annotate(
+            distance=CosineDistance(
+                "embedding",
+                question_embedding,
+            ),
+        )
+        .order_by("distance")[:candidate_count]
+    )
+
+    candidates = list(queryset)
+
+    if not candidates:
+        return []
+
+    scored: list[RetrievedChunk] = []
+
+    for chunk in candidates:
+        distance = float(chunk.distance)
+        vector_score = compute_vector_score(distance)
+        keyword_score = compute_keyword_score(
+            question,
+            chunk.text,
+        )
+        final_score = (0.7 * vector_score) + (0.3 * keyword_score)
+
+        scored.append(
+            RetrievedChunk(
+                document_id=chunk.document_id,
+                document_title=chunk.document.title,
+                chunk_index=chunk.chunk_index,
+                text=chunk.text,
+                distance=distance,
+                vector_score=vector_score,
+                keyword_score=keyword_score,
+                final_score=final_score,
+            )
+        )
+
+    scored.sort(
+        key=lambda item: item.final_score,
+        reverse=True,
+    )
+
+    return scored[:top_k]

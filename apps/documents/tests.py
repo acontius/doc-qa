@@ -27,14 +27,19 @@ from rest_framework import status
 from .models import Document, DocumentChunk
 from .services import (
     DocumentIngestionError,
+    DocumentRetrievalError,
     EmbeddingConfigurationError,
     EmbeddingService,
+    compute_keyword_score,
+    compute_vector_score,
     create_document,
     delete_document,
     extract_docx_text,
     get_embedding_service,
     reindex_document,
+    retrieve_chunks,
     split_document_text,
+    tokenize_text,
     update_document,
     validate_docx_upload,
 )
@@ -1564,3 +1569,292 @@ class RealEmbeddingIntegrationTests(
                 document.file.name,
             )
         )
+
+
+
+class TokenizerTests(TestCase):
+    def test_english_tokenization(self):
+        tokens = tokenize_text("Hello, World! 123")
+        self.assertEqual(
+            tokens,
+            ["hello", "world", "123"],
+        )
+
+    def test_persian_tokenization(self):
+        tokens = tokenize_text("مرخصی کارکنان سالانه")
+        self.assertIn("مرخصی", tokens)
+        self.assertIn("کارکنان", tokens)
+        self.assertIn("سالانه", tokens)
+
+    def test_mixed_persian_english(self):
+        tokens = tokenize_text("قرارداد Contract سالانه 2024")
+        self.assertIn("قرارداد", tokens)
+        self.assertIn("contract", tokens)
+        self.assertIn("سالانه", tokens)
+        self.assertIn("2024", tokens)
+
+    def test_punctuation_ignored(self):
+        tokens = tokenize_text("hello!!! world???")
+        self.assertEqual(tokens, ["hello", "world"])
+
+    def test_persian_character_normalization(self):
+        # Arabic yeh/kaf should normalize to Persian forms
+        arabic = tokenize_text("يك قرارداد")
+        persian = tokenize_text("یک قرارداد")
+        self.assertEqual(arabic, persian)
+
+
+class ScoringTests(TestCase):
+    def test_keyword_score_exact_overlap(self):
+        score = compute_keyword_score(
+            "مرخصی کارکنان",
+            "مرخصی کارکنان سالانه بیست روز است",
+        )
+        self.assertEqual(score, 1.0)
+
+    def test_keyword_score_no_overlap(self):
+        score = compute_keyword_score(
+            "مرخصی کارکنان",
+            "ساعات کاری شرکت هشت صبح است",
+        )
+        self.assertEqual(score, 0.0)
+
+    def test_keyword_score_partial_overlap(self):
+        score = compute_keyword_score(
+            "مرخصی سالانه کارکنان",
+            "مرخصی کارکنان در شرکت",
+        )
+        self.assertAlmostEqual(score, 2 / 3, places=5)
+
+    def test_vector_score_formula(self):
+        self.assertAlmostEqual(
+            compute_vector_score(0.0),
+            1.0,
+            places=6,
+        )
+        self.assertAlmostEqual(
+            compute_vector_score(1.0),
+            0.5,
+            places=6,
+        )
+
+
+class RetrievalServiceTests(
+    DocumentTestMixin,
+    TemporaryMediaMixin,
+    TestCase,
+):
+    def _seed_chunks(self):
+        """
+        Create three documents with one deterministic chunk each.
+        Embeddings are mocked so values only need correct dimension.
+        """
+        docs = []
+        texts = [
+            ("مرخصی", "مرخصی کارکنان سالانه بیست روز است."),
+            ("ساعات", "ساعات کاری شرکت از ساعت هشت صبح تا چهار بعدازظهر است."),
+            ("قرارداد", "قرارداد کارکنان به صورت یک ساله تنظیم می‌شود."),
+        ]
+
+        for index, (title, chunk_text) in enumerate(texts):
+            document = Document.objects.create(
+                title=title,
+                full_text=chunk_text,
+                chunk_count=1,
+                embedding_model=settings.EMBEDDING_MODEL,
+            )
+            # minimal valid file field for model constraints
+            from django.core.files.base import ContentFile
+            document.file.save(
+                f"{title}.docx",
+                ContentFile(b"dummy"),
+                save=True,
+            )
+
+            # Different embeddings so distance ordering is stable under mock
+            embedding = [0.0] * settings.EMBEDDING_DIMENSION
+            embedding[0] = 1.0 if index == 0 else 0.0
+            embedding[1] = 1.0 if index == 1 else 0.0
+            embedding[2] = 1.0 if index == 2 else 0.0
+
+            DocumentChunk.objects.create(
+                document=document,
+                chunk_index=0,
+                text=chunk_text,
+                embedding=embedding,
+            )
+            docs.append(document)
+
+        return docs
+
+    def test_empty_question_rejected(self):
+        with self.assertRaises(DocumentRetrievalError) as ctx:
+            retrieve_chunks("")
+        self.assertEqual(ctx.exception.code, "empty_question")
+
+    def test_whitespace_question_rejected(self):
+        with self.assertRaises(DocumentRetrievalError) as ctx:
+            retrieve_chunks("   ")
+        self.assertEqual(ctx.exception.code, "empty_question")
+
+    def test_top_k_zero_rejected(self):
+        with self.assertRaises(DocumentRetrievalError) as ctx:
+            retrieve_chunks("سوال", top_k=0)
+        self.assertEqual(ctx.exception.code, "invalid_top_k")
+
+    def test_top_k_negative_rejected(self):
+        with self.assertRaises(DocumentRetrievalError) as ctx:
+            retrieve_chunks("سوال", top_k=-1)
+        self.assertEqual(ctx.exception.code, "invalid_top_k")
+
+    def test_top_k_too_large_rejected(self):
+        with self.assertRaises(DocumentRetrievalError) as ctx:
+            retrieve_chunks("سوال", top_k=100)
+        self.assertEqual(ctx.exception.code, "invalid_top_k")
+
+    def test_empty_document_ids_rejected(self):
+        with self.assertRaises(DocumentRetrievalError) as ctx:
+            retrieve_chunks("سوال", document_ids=[])
+        self.assertEqual(ctx.exception.code, "empty_document_ids")
+
+    def test_retrieve_returns_empty_when_no_chunks(self):
+        with self.mocked_embedding_service():
+            results = retrieve_chunks("هر سوالی")
+        self.assertEqual(results, [])
+
+    def test_hybrid_ranking_and_metadata(self):
+        docs = self._seed_chunks()
+
+        # Question embedding aligned with "مرخصی" chunk (dim 0)
+        with self.mocked_embedding_service(value=0.0) as embedding_service:
+            embedding_service.embed_documents.side_effect = (
+                lambda texts: [
+                    [1.0, 0.0, 0.0] + [0.0] * (settings.EMBEDDING_DIMENSION - 3)
+                    for _ in texts
+                ]
+            )
+
+            results = retrieve_chunks(
+                "میزان مرخصی سالانه کارکنان چقدر است؟",
+                top_k=2,
+            )
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].document_id, docs[0].id)
+        self.assertEqual(results[0].document_title, "مرخصی")
+        self.assertEqual(results[0].chunk_index, 0)
+        self.assertIn("مرخصی", results[0].text)
+        self.assertGreater(
+            results[0].final_score,
+            results[1].final_score,
+        )
+
+        # final_score formula
+        expected = (
+            0.7 * results[0].vector_score
+            + 0.3 * results[0].keyword_score
+        )
+        self.assertAlmostEqual(
+            results[0].final_score,
+            expected,
+            places=6,
+        )
+
+    def test_document_ids_filter(self):
+        docs = self._seed_chunks()
+
+        with self.mocked_embedding_service(value=0.01):
+            results = retrieve_chunks(
+                "ساعات کاری",
+                top_k=6,
+                document_ids=[docs[1].id],
+            )
+
+        self.assertTrue(results)
+        for item in results:
+            self.assertEqual(item.document_id, docs[1].id)
+
+    def test_top_k_limits_results(self):
+        docs = self._seed_chunks()
+
+        with self.mocked_embedding_service(value=0.01):
+            results = retrieve_chunks(
+                "کارکنان",
+                top_k=1,
+            )
+
+        self.assertEqual(len(results), 1)
+
+    def test_uses_embedding_service(self):
+        self._seed_chunks()
+
+        with self.mocked_embedding_service() as embedding_service:
+            retrieve_chunks("سوال آزمایشی", top_k=1)
+
+        embedding_service.embed_documents.assert_called()
+
+
+class RetrievalAPITests(
+    DocumentTestMixin,
+    TemporaryMediaMixin,
+    APITestCase,
+):
+    def setUp(self):
+        self.client = APIClient()
+
+    def test_retrieval_endpoint_validation(self):
+        response = self.client.post(
+            "/api/retrieval/",
+            {"question": "   "},
+            format="json",
+        )
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+    def test_retrieval_endpoint_success(self):
+        document = Document.objects.create(
+            title="Policy",
+            full_text="مرخصی کارکنان سالانه بیست روز است.",
+            chunk_count=1,
+            embedding_model=settings.EMBEDDING_MODEL,
+        )
+        from django.core.files.base import ContentFile
+        document.file.save(
+            "policy.docx",
+            ContentFile(b"dummy"),
+            save=True,
+        )
+        embedding = [0.01] * settings.EMBEDDING_DIMENSION
+        DocumentChunk.objects.create(
+            document=document,
+            chunk_index=0,
+            text="مرخصی کارکنان سالانه بیست روز است.",
+            embedding=embedding,
+        )
+
+        with self.mocked_embedding_service():
+            response = self.client.post(
+                "/api/retrieval/",
+                {
+                    "question": "مرخصی کارکنان چقدر است؟",
+                    "top_k": 3,
+                },
+                format="json",
+            )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+        self.assertEqual(
+            response.data["question"],
+            "مرخصی کارکنان چقدر است؟",
+        )
+        self.assertIsInstance(response.data["results"], list)
+        if response.data["results"]:
+            first = response.data["results"][0]
+            self.assertIn("document_id", first)
+            self.assertIn("final_score", first)
+            self.assertIn("text", first)

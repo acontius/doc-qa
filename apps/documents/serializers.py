@@ -101,3 +101,44 @@ class DocumentDetailSerializer(serializers.ModelSerializer):
         return Path(
             obj.file.name
         ).name
+
+
+class RetrievalRequestSerializer(serializers.Serializer):
+    question = serializers.CharField(
+        allow_blank=False,
+        trim_whitespace=True,
+    )
+    top_k = serializers.IntegerField(
+        required=False,
+        min_value=1,
+        max_value=50,
+    )
+    document_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        required=False,
+        allow_empty=False,
+    )
+
+    def validate_question(self, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError(
+                "سوال نمی‌تواند خالی باشد."
+            )
+        return value
+
+
+class RetrievedChunkSerializer(serializers.Serializer):
+    document_id = serializers.IntegerField()
+    document_title = serializers.CharField()
+    chunk_index = serializers.IntegerField()
+    text = serializers.CharField()
+    distance = serializers.FloatField()
+    vector_score = serializers.FloatField()
+    keyword_score = serializers.FloatField()
+    final_score = serializers.FloatField()
+
+
+class RetrievalResponseSerializer(serializers.Serializer):
+    question = serializers.CharField()
+    results = RetrievedChunkSerializer(many=True)

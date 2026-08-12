@@ -5,6 +5,7 @@ from drf_spectacular.utils import (
     extend_schema_view,
 )
 from rest_framework import status, viewsets
+from rest_framework.views import APIView
 from rest_framework.parsers import (
     FormParser,
     JSONParser,
@@ -18,12 +19,16 @@ from .serializers import (
     DocumentDetailSerializer,
     DocumentListSerializer,
     DocumentWriteSerializer,
+    RetrievalRequestSerializer,
+    RetrievalResponseSerializer,
 )
 from .services import (
     DocumentIngestionError,
+    DocumentRetrievalError,
     create_document,
     delete_document,
     reindex_document,
+    retrieve_chunks,
     update_document,
 )
 
@@ -313,3 +318,110 @@ class DocumentViewSet(viewsets.ModelViewSet):
         return Response(
             DocumentDetailSerializer(document).data,
         )
+
+
+
+class RetrievalView(APIView):
+    """
+    Hybrid retrieval over indexed document chunks.
+    Does not call an LLM.
+    """
+
+    def handle_exception(self, exc):
+        response = super().handle_exception(exc)
+
+        if response is not None:
+            if response.status_code == status.HTTP_400_BAD_REQUEST:
+                response.data = {
+                    "error": {
+                        "code": "validation_error",
+                        "message": "اطلاعات ارسالی معتبر نیست.",
+                        "details": response.data,
+                    }
+                }
+            return response
+
+        logger.exception("Unhandled exception in Retrieval API")
+        return Response(
+            {
+                "error": {
+                    "code": "internal_error",
+                    "message": "خطای داخلی سرور رخ داد.",
+                }
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    @extend_schema(
+        summary="Retrieve relevant chunks",
+        description=(
+            "Embed the question, search pgvector candidates, "
+            "apply keyword scoring, and return hybrid-ranked top-k chunks."
+        ),
+        request=RetrievalRequestSerializer,
+        responses=RetrievalResponseSerializer,
+    )
+    def post(self, request, *args, **kwargs):
+        serializer = RetrievalRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        question = serializer.validated_data["question"]
+        top_k = serializer.validated_data.get("top_k")
+        document_ids = serializer.validated_data.get("document_ids")
+
+        try:
+            results = retrieve_chunks(
+                question,
+                top_k=top_k,
+                document_ids=document_ids,
+            )
+        except DocumentRetrievalError as exc:
+            return Response(
+                {
+                    "error": {
+                        "code": exc.code,
+                        "message": exc.message,
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except DocumentIngestionError as exc:
+            return Response(
+                {
+                    "error": {
+                        "code": exc.code,
+                        "message": exc.message,
+                    }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception:
+            logger.exception("Unexpected retrieval failure")
+            return Response(
+                {
+                    "error": {
+                        "code": "retrieval_failed",
+                        "message": "بازیابی اطلاعات با خطا مواجه شد.",
+                    }
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        payload = {
+            "question": question,
+            "results": [
+                {
+                    "document_id": item.document_id,
+                    "document_title": item.document_title,
+                    "chunk_index": item.chunk_index,
+                    "text": item.text,
+                    "distance": item.distance,
+                    "vector_score": item.vector_score,
+                    "keyword_score": item.keyword_score,
+                    "final_score": item.final_score,
+                }
+                for item in results
+            ],
+        }
+
+        return Response(payload, status=status.HTTP_200_OK)
