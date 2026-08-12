@@ -451,21 +451,62 @@ def _replace_chunks(
     )
 
 
+def _delete_stored_file(file_name: str, full_path: str | None = None) -> None:
+    """
+    Delete a stored upload by storage name and/or absolute filesystem path.
+    """
+    if file_name:
+        try:
+            default_storage.delete(file_name)
+        except Exception:
+            logger.exception(
+                "default_storage.delete failed",
+                extra={"file_name": file_name},
+            )
+
+    candidates: list[Path] = []
+
+    if full_path:
+        candidates.append(Path(full_path))
+
+    if file_name:
+        candidates.append(Path(str(settings.MEDIA_ROOT)) / file_name)
+        try:
+            candidates.append(Path(default_storage.path(file_name)))
+        except Exception:
+            pass
+
+    for path in candidates:
+        try:
+            if path.is_file():
+                path.unlink()
+        except Exception:
+            logger.exception(
+                "Filesystem unlink failed",
+                extra={"path": str(path)},
+            )
+
+
 def create_document(
     *,
     title: str,
     uploaded_file,
 ) -> Document:
-    validate_docx_upload(uploaded_file)
+    """
+    Validate, persist, extract, chunk, embed, and store a new document.
+    """
+    prepared = prepare_document(uploaded_file)
 
-    document = None
-    saved_file_name = None
+    saved_file_name: str | None = None
+    saved_full_path: str | None = None
 
     try:
         with transaction.atomic():
             document = Document(
                 title=title,
-                embedding_model=settings.EMBEDDING_MODEL,
+                full_text=prepared.full_text,
+                chunk_count=len(prepared.chunks),
+                embedding_model=prepared.embedding_model,
             )
 
             document.file.save(
@@ -476,47 +517,21 @@ def create_document(
 
             saved_file_name = document.file.name
 
-            full_text = extract_docx_text(
-                document.file,
-            )
-
-            chunks = chunk_text(full_text)
-
-            embeddings = embedding_service.embed_documents(
-                chunks,
-            )
-
-            document.full_text = full_text
-            document.chunk_count = len(chunks)
-
-            document.save()
-
-            DocumentChunk.objects.bulk_create(
-                [
-                    DocumentChunk(
-                        document=document,
-                        chunk_index=index,
-                        text=text,
-                        embedding=embedding,
-                    )
-                    for index, (text, embedding)
-                    in enumerate(zip(chunks, embeddings))
-                ]
-            )
-
-    except Exception:
-        if saved_file_name:
             try:
-                default_storage.delete(saved_file_name)
+                saved_full_path = document.file.path
             except Exception:
-                logger.exception(
-                    "Failed to clean up uploaded file after rollback",
+                saved_full_path = str(
+                    Path(str(settings.MEDIA_ROOT)) / saved_file_name
                 )
 
+            document.save()
+            _replace_chunks(document, prepared)
+
+    except Exception:
+        _delete_stored_file(saved_file_name or "", saved_full_path)
         raise
 
     return document
-
 
 
 def update_document(
@@ -525,6 +540,9 @@ def update_document(
     title: str,
     uploaded_file=None,
 ) -> Document:
+    """
+    Update title only, or replace the source file and re-index.
+    """
     if uploaded_file is None:
         document.title = title
         document.save(
@@ -535,14 +553,29 @@ def update_document(
         )
         return document
 
-    validate_docx_upload(uploaded_file)
+    prepared = prepare_document(uploaded_file)
 
-    old_file_name = document.file.name
-    new_file_name = None
+    old_file_name = document.file.name if document.file else None
+    old_full_path: str | None = None
+
+    if document.file:
+        try:
+            old_full_path = document.file.path
+        except Exception:
+            if old_file_name:
+                old_full_path = str(
+                    Path(str(settings.MEDIA_ROOT)) / old_file_name
+                )
+
+    new_file_name: str | None = None
+    new_full_path: str | None = None
 
     try:
         with transaction.atomic():
             document.title = title
+            document.full_text = prepared.full_text
+            document.chunk_count = len(prepared.chunks)
+            document.embedding_model = prepared.embedding_model
 
             document.file.save(
                 uploaded_file.name,
@@ -552,64 +585,28 @@ def update_document(
 
             new_file_name = document.file.name
 
-            full_text = extract_docx_text(
-                document.file,
-            )
-
-            chunks = chunk_text(full_text)
-
-            embeddings = embedding_service.embed_documents(
-                chunks,
-            )
-
-            document.full_text = full_text
-            document.chunk_count = len(chunks)
-            document.embedding_model = settings.EMBEDDING_MODEL
-
-            document.save()
-
-            document.chunks.all().delete()
-
-            DocumentChunk.objects.bulk_create(
-                [
-                    DocumentChunk(
-                        document=document,
-                        chunk_index=index,
-                        text=text,
-                        embedding=embedding,
-                    )
-                    for index, (text, embedding)
-                    in enumerate(zip(chunks, embeddings))
-                ]
-            )
-
-    except Exception:
-        if new_file_name:
             try:
-                default_storage.delete(new_file_name)
+                new_full_path = document.file.path
             except Exception:
-                logger.exception(
-                    "Failed to clean up replacement file after rollback",
+                new_full_path = str(
+                    Path(str(settings.MEDIA_ROOT)) / new_file_name
                 )
 
+            document.save()
+            _replace_chunks(document, prepared)
+
+    except Exception:
+        _delete_stored_file(new_file_name or "", new_full_path)
         raise
 
     if (
         old_file_name
         and old_file_name != new_file_name
     ):
-        try:
-            default_storage.delete(old_file_name)
-        except Exception:
-            logger.exception(
-                "Failed to delete old document file",
-                extra={
-                    "file_name": old_file_name,
-                },
-            )
-            raise
+        _delete_stored_file(old_file_name, old_full_path)
 
     return document
+
 
 def reindex_document(
     document: Document,
@@ -664,18 +661,19 @@ def reindex_document(
 
 def delete_document(document: Document) -> None:
     file_name = document.file.name if document.file else None
+    full_path: str | None = None
+
+    if document.file:
+        try:
+            full_path = document.file.path
+        except Exception:
+            if file_name:
+                full_path = str(
+                    Path(str(settings.MEDIA_ROOT)) / file_name
+                )
 
     with transaction.atomic():
         document.delete()
 
     if file_name:
-        try:
-            default_storage.delete(file_name)
-        except Exception:
-            logger.exception(
-                "Failed to delete document file",
-                extra={
-                    "file_name": file_name,
-                },
-            )
-            raise
+        _delete_stored_file(file_name, full_path)

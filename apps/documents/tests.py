@@ -19,7 +19,8 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
 from django.test import (
     TestCase,
-    override_settings)
+    override_settings,
+)
 from docx import Document as DocxDocument
 from rest_framework import status
 
@@ -122,9 +123,20 @@ class TemporaryMediaMixin:
         )
 
         cls._media_override = override_settings(
-            MEDIA_ROOT=cls._media_root,
+            MEDIA_ROOT=str(cls._media_root),
         )
         cls._media_override.enable()
+
+        # Django caches storage instances and LazyObject wrappers.
+        # Reset both so the new MEDIA_ROOT is used for file I/O.
+        from django.core.files.storage import (
+            default_storage,
+            storages,
+        )
+        from django.utils.functional import empty
+
+        storages._storages.clear()
+        default_storage._wrapped = empty
 
         super().setUpClass()
 
@@ -134,6 +146,14 @@ class TemporaryMediaMixin:
             super().tearDownClass()
         finally:
             cls._media_override.disable()
+            from django.core.files.storage import (
+                default_storage,
+                storages,
+            )
+            from django.utils.functional import empty
+
+            storages._storages.clear()
+            default_storage._wrapped = empty
             shutil.rmtree(
                 cls._media_root,
                 ignore_errors=True,
@@ -610,29 +630,11 @@ class EmbeddingServiceTests(TestCase):
         mock_embedding_service.assert_called_once()
 
 
-@override_settings(
-    MEDIA_ROOT=tempfile.mkdtemp(
-        prefix="doc_qa_service_media_",
-    ),
-)
 class DocumentServiceTests(
     DocumentTestMixin,
     TemporaryMediaMixin,
     TestCase,
 ):
-    @classmethod
-    def tearDownClass(cls):
-        media_root = Path(
-            settings.MEDIA_ROOT,
-        )
-
-        super().tearDownClass()
-
-        shutil.rmtree(
-            media_root,
-            ignore_errors=True,
-        )
-
     def test_create_document_creates_complete_state(self):
         with self.mocked_embedding_service():
             content = self.make_docx(
@@ -747,6 +749,14 @@ class DocumentServiceTests(
     def test_create_document_rolls_back_database_and_file(
         self,
     ):
+        # Other tests in this class may leave files on disk
+        # (TestCase rolls back DB rows, not filesystem writes).
+        files_before = {
+            path
+            for path in Path(settings.MEDIA_ROOT).rglob("*")
+            if path.is_file()
+        }
+
         with self.mocked_embedding_service():
             content = self.make_docx(
                 paragraphs=[
@@ -780,15 +790,16 @@ class DocumentServiceTests(
             0,
         )
 
-        files = [
+        files_after = {
             path
             for path in Path(settings.MEDIA_ROOT).rglob("*")
             if path.is_file()
-        ]
+        }
 
+        # The failed create must not leave a new orphaned file.
         self.assertEqual(
-            files,
-            [],
+            files_after,
+            files_before,
         )
 
     def test_update_title_does_not_reindex(self):
@@ -1075,42 +1086,11 @@ class DocumentServiceTests(
         )
 
 
-
-@override_settings(
-    MEDIA_ROOT="/tmp/doc_qa_api_media",
-)
-class DocumentAPITests(APITestCase):
-# class DocumentAPITests(
-#     DocumentTestMixin,
-#     TemporaryMediaMixin,
-#     TestCase,
-# ):
-    @classmethod
-    def setUpClass(cls):
-        cls._media_root = Path(
-            tempfile.mkdtemp(
-                prefix="doc_qa_api_media_",
-            )
-        )
-
-        cls._media_override = override_settings(
-            MEDIA_ROOT=cls._media_root,
-        )
-        cls._media_override.enable()
-
-        super().setUpClass()
-
-    @classmethod
-    def tearDownClass(cls):
-        try:
-            super().tearDownClass()
-        finally:
-            cls._media_override.disable()
-            shutil.rmtree(
-                cls._media_root,
-                ignore_errors=True,
-            )
-
+class DocumentAPITests(
+    DocumentTestMixin,
+    TemporaryMediaMixin,
+    APITestCase,
+):
     def setUp(self):
         self.client = APIClient()
 
