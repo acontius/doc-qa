@@ -14,6 +14,7 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
         required=False,
         allow_empty_file=False,
         write_only=True,
+        help_text="DOCX file only. Max size controlled by MAX_UPLOAD_SIZE_MB.",
     )
 
     class Meta:
@@ -22,6 +23,11 @@ class DocumentWriteSerializer(serializers.ModelSerializer):
             "title",
             "file",
         ]
+        extra_kwargs = {
+            "title": {
+                "help_text": "Human-readable document title.",
+            },
+        }
 
     def validate_title(self, value: str) -> str:
         value = value.strip()
@@ -148,16 +154,19 @@ class QuestionRequestSerializer(serializers.Serializer):
     question = serializers.CharField(
         allow_blank=False,
         trim_whitespace=True,
+        help_text="User question in Persian or English.",
     )
     top_k = serializers.IntegerField(
         required=False,
         min_value=1,
         max_value=50,
+        help_text="Retrieval top_k (default: RETRIEVER_TOP_K).",
     )
     document_ids = serializers.ListField(
         child=serializers.IntegerField(min_value=1),
         required=False,
         allow_empty=False,
+        help_text="Optional: only search these document IDs.",
     )
 
     def validate_question(self, value: str) -> str:
@@ -177,6 +186,10 @@ class AnswerSourceSerializer(serializers.Serializer):
 
 
 class QuestionResponseSerializer(serializers.Serializer):
+    id = serializers.IntegerField(
+        required=False,
+        help_text="Persisted Question history id.",
+    )
     question = serializers.CharField()
     answer = serializers.CharField()
     sources = AnswerSourceSerializer(many=True)
@@ -264,10 +277,23 @@ class QuestionDetailSerializer(serializers.ModelSerializer):
             return None
         return {
             "text": ans.text,
+            "raw_llm_output": ans.raw_llm_output,
             "confidence": ans.confidence,
             "sources": ans.sources_json or [],
             "model_name": ans.model_name,
             "latency_ms": ans.latency_ms,
             "error": ans.error or None,
         }
+
+
+class APIErrorBodySerializer(serializers.Serializer):
+    code = serializers.CharField()
+    message = serializers.CharField()
+    details = serializers.JSONField(required=False)
+
+
+class APIErrorSerializer(serializers.Serializer):
+    """Standard API error envelope."""
+
+    error = APIErrorBodySerializer()
 

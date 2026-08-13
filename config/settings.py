@@ -168,12 +168,25 @@ REST_FRAMEWORK = {
 SPECTACULAR_SETTINGS = {
     "TITLE": "Document Q&A API",
     "DESCRIPTION": (
-        "REST API for document ingestion, retrieval, "
-        "and grounded question answering."
+        "Dockerized Django Document Q&A / RAG API.\n\n"
+        "Pipeline: DOCX upload → extract → chunk → embed (pgvector) → "
+        "hybrid retrieval → grounded LLM answer → question history.\n\n"
+        "Answers are grounded in uploaded documents only. "
+        "If no useful context is found, the answer is:\n"
+        "در اسناد ارائه‌شده پاسخی یافت نشد.\n\n"
+        "List endpoints use page-number pagination (default page size: 20).\n\n"
+        "Errors use:\n"
+        '{ "error": { "code": "...", "message": "...", "details": {} } }'
     ),
-    "VERSION": "0.1.0",
+    "VERSION": "0.2.0",
     "SERVE_INCLUDE_SCHEMA": False,
     "COMPONENT_SPLIT_REQUEST": True,
+    "TAGS": [
+        {"name": "health", "description": "Service health checks"},
+        {"name": "documents", "description": "DOCX ingestion and lifecycle"},
+        {"name": "retrieval", "description": "Hybrid chunk retrieval (no LLM)"},
+        {"name": "questions", "description": "Grounded Q&A and history"},
+    ],
 }
 
 

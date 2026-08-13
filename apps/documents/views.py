@@ -1,6 +1,8 @@
 import logging
 
 from drf_spectacular.utils import (
+    OpenApiExample,
+    OpenApiResponse,
     extend_schema,
     extend_schema_view,
 )
@@ -25,6 +27,7 @@ from .serializers import (
     QuestionResponseSerializer,
     QuestionListSerializer,
     QuestionDetailSerializer,
+    APIErrorSerializer,
 )
 from .services import (
     DocumentIngestionError,
@@ -44,27 +47,68 @@ logger = logging.getLogger(__name__)
 
 @extend_schema_view(
     list=extend_schema(
+        tags=["documents"],
         summary="List documents",
-        description="Return a paginated list of indexed documents.",
+        description=(
+            "Paginated list of indexed documents. "
+            "Default page size is 20 (PageNumberPagination)."
+        ),
+        responses={200: DocumentListSerializer, 400: APIErrorSerializer},
     ),
     retrieve=extend_schema(
+        tags=["documents"],
         summary="Get document",
         description="Return a document and its extracted full text.",
+        responses={200: DocumentDetailSerializer, 404: APIErrorSerializer},
     ),
     create=extend_schema(
+        tags=["documents"],
         summary="Upload DOCX document",
         description=(
-            "Upload and synchronously index a DOCX document."
+            "Upload and synchronously index a DOCX file.\n\n"
+            "Content-Type: multipart/form-data\n"
+            "- title (required)\n"
+            "- file (required, .docx only)\n"
+            "Max size: MAX_UPLOAD_SIZE_MB.\n\n"
+            "Pipeline: validate → extract → chunk → embed → pgvector."
         ),
+        request=DocumentWriteSerializer,
+        responses={
+            201: DocumentDetailSerializer,
+            400: APIErrorSerializer,
+            500: APIErrorSerializer,
+        },
     ),
     update=extend_schema(
-        summary="Replace document",
+        tags=["documents"],
+        summary="Replace document (PUT)",
+        responses={
+            200: DocumentDetailSerializer,
+            400: APIErrorSerializer,
+            404: APIErrorSerializer,
+        },
     ),
     partial_update=extend_schema(
-        summary="Update document",
+        tags=["documents"],
+        summary="Update document (PATCH)",
+        description=(
+            "PATCH title only: metadata, no reindex. "
+            "PATCH with file: full re-ingestion."
+        ),
+        responses={
+            200: DocumentDetailSerializer,
+            400: APIErrorSerializer,
+            404: APIErrorSerializer,
+        },
     ),
     destroy=extend_schema(
+        tags=["documents"],
         summary="Delete document",
+        description="Delete document, chunks, and stored DOCX file.",
+        responses={
+            204: OpenApiResponse(description="Deleted"),
+            404: APIErrorSerializer,
+        },
     ),
 )
 class DocumentViewSet(viewsets.ModelViewSet):
@@ -277,6 +321,7 @@ class DocumentViewSet(viewsets.ModelViewSet):
         url_path="reindex",
     )
     @extend_schema(
+        tags=["documents"],
         summary="Reindex document",
         description=(
             "Re-extract, rechunk, and re-embed the stored DOCX file."
@@ -360,13 +405,40 @@ class RetrievalView(APIView):
         )
 
     @extend_schema(
+        tags=["retrieval"],
         summary="Retrieve relevant chunks",
         description=(
-            "Embed the question, search pgvector candidates, "
-            "apply keyword scoring, and return hybrid-ranked top-k chunks."
+            "Hybrid retrieval only (no LLM).\n\n"
+            "Embed question → pgvector cosine candidates "
+            "(top_k * RETRIEVER_CANDIDATE_MULTIPLIER) → "
+            "keyword score → final_score = 0.7*vector + 0.3*keyword → top_k.\n\n"
+            "Optional document_ids limits search to specific documents."
         ),
         request=RetrievalRequestSerializer,
-        responses=RetrievalResponseSerializer,
+        responses={
+            200: RetrievalResponseSerializer,
+            400: APIErrorSerializer,
+            500: APIErrorSerializer,
+        },
+        examples=[
+            OpenApiExample(
+                "Persian question",
+                value={
+                    "question": "میزان مرخصی سالانه کارکنان چقدر است؟",
+                    "top_k": 6,
+                },
+                request_only=True,
+            ),
+            OpenApiExample(
+                "Filtered documents",
+                value={
+                    "question": "ساعات کاری چیست؟",
+                    "top_k": 3,
+                    "document_ids": [1, 2],
+                },
+                request_only=True,
+            ),
+        ],
     )
     def post(self, request, *args, **kwargs):
         serializer = RetrievalRequestSerializer(data=request.data)
@@ -450,13 +522,36 @@ class QuestionViewSet(viewsets.GenericViewSet):
 
 
     @extend_schema(
+        tags=["questions"],
         summary="Ask a grounded question",
         description=(
-            "Retrieve relevant chunks, call the LLM, persist Question/Answer "
-            "history, and return a grounded response."
+            "Full RAG with history persistence.\n\n"
+            "1. Validate + create Question\n"
+            "2. Hybrid retrieval\n"
+            "3. LLM if context exists (OpenRouter via LangChain)\n"
+            "4. Persist Answer snapshot\n"
+            "5. Return answer + sources + confidence\n\n"
+            "Empty retrieval → no LLM call → "
+            "در اسناد ارائه‌شده پاسخی یافت نشد.\n\n"
+            "LLM failures return 503; Question history is still kept."
         ),
         request=QuestionRequestSerializer,
-        responses={200: QuestionResponseSerializer},
+        responses={
+            200: QuestionResponseSerializer,
+            400: APIErrorSerializer,
+            503: APIErrorSerializer,
+            500: APIErrorSerializer,
+        },
+        examples=[
+            OpenApiExample(
+                "Simple Persian question",
+                value={
+                    "question": "این سند درباره چیست؟",
+                    "top_k": 3,
+                },
+                request_only=True,
+            ),
+        ],
     )
     def create(self, request, *args, **kwargs):
         serializer = QuestionRequestSerializer(data=request.data)
@@ -519,8 +614,13 @@ class QuestionViewSet(viewsets.GenericViewSet):
         return Response(payload, status=status.HTTP_200_OK)
 
     @extend_schema(
+        tags=["questions"],
         summary="List question history",
-        responses=QuestionListSerializer(many=True),
+        description=(
+            "Paginated Q&A history (newest first). "
+            "Lightweight: no raw_llm_output. Page size 20."
+        ),
+        responses={200: QuestionListSerializer},
     )
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
@@ -532,8 +632,16 @@ class QuestionViewSet(viewsets.GenericViewSet):
         return Response(serializer.data)
 
     @extend_schema(
+        tags=["questions"],
         summary="Get question history detail",
-        responses=QuestionDetailSerializer,
+        description=(
+            "Full history entry including answer text, sources snapshot, "
+            "raw_llm_output, confidence, model_name, latency, error."
+        ),
+        responses={
+            200: QuestionDetailSerializer,
+            404: APIErrorSerializer,
+        },
     )
     def retrieve(self, request, *args, **kwargs):
         try:

@@ -19,6 +19,9 @@ class HealthResponseSerializer(serializers.Serializer):
 
 
 @extend_schema(
+    tags=["health"],
+    summary="Service health",
+
     responses=HealthResponseSerializer,
     description="Returns application and dependency health status.",
 )

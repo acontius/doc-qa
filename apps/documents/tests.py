@@ -2442,3 +2442,76 @@ class QuestionAdminRegistrationTests(TestCase):
         self.assertTrue(dj_admin.site.is_registered(Question))
         self.assertTrue(dj_admin.site.is_registered(Answer))
 
+
+class APIDocumentationTests(APITestCase):
+    """Milestone 6: schema, routing, pagination, error envelope."""
+
+    def setUp(self):
+        self.client = APIClient()
+
+    def test_health_endpoint(self):
+        response = self.client.get("/api/health/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        for key in ("status", "db", "vector", "llm_configured"):
+            self.assertIn(key, response.data)
+
+    def test_openapi_schema_available(self):
+        response = self.client.get("/api/schema/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        content = response.content.decode("utf-8", errors="ignore")
+        self.assertTrue(
+            "openapi" in content.lower()
+            or "Document Q&A" in content
+            or "paths" in content
+        )
+
+    def test_swagger_ui_available(self):
+        response = self.client.get("/api/docs/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_documents_list_pagination_shape(self):
+        response = self.client.get("/api/documents/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("count", response.data)
+        self.assertIn("results", response.data)
+        self.assertIn("next", response.data)
+        self.assertIn("previous", response.data)
+
+    def test_questions_list_pagination_shape(self):
+        response = self.client.get("/api/questions/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("count", response.data)
+        self.assertIn("results", response.data)
+
+    def test_document_not_found_error_envelope(self):
+        response = self.client.get("/api/documents/999999/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertIn("error", response.data)
+        self.assertIn("code", response.data["error"])
+        self.assertIn("message", response.data["error"])
+
+    def test_question_not_found_error_envelope(self):
+        response = self.client.get("/api/questions/999999/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(
+            response.data["error"]["code"],
+            "question_not_found",
+        )
+
+    def test_schema_mentions_core_paths(self):
+        response = self.client.get(
+            "/api/schema/",
+            HTTP_ACCEPT="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        data = response.data if isinstance(response.data, dict) else None
+        if data is None:
+            import json
+            data = json.loads(response.content.decode())
+        paths = data.get("paths", {})
+        path_keys = " ".join(paths.keys())
+        self.assertIn("/api/documents/", path_keys)
+        self.assertIn("/api/questions/", path_keys)
+        self.assertIn("/api/retrieval/", path_keys)
+        self.assertIn("/api/health/", path_keys)
+
