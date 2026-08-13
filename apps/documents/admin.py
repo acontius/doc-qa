@@ -3,7 +3,7 @@ import logging
 from django.contrib import admin, messages
 
 from .forms import DocumentAdminForm
-from .models import Document, DocumentChunk
+from .models import Answer, Document, DocumentChunk, Question
 from .services import (
     DocumentIngestionError,
     create_document,
@@ -237,3 +237,58 @@ class DocumentChunkAdmin(admin.ModelAdmin):
         obj=None,
     ) -> bool:
         return True
+
+
+@admin.register(Question)
+class QuestionAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "short_text",
+        "top_k",
+        "created_at",
+    )
+    search_fields = ("text",)
+    ordering = ("-created_at",)
+    readonly_fields = (
+        "text",
+        "top_k",
+        "document_ids",
+        "created_at",
+    )
+
+    @admin.display(description="question")
+    def short_text(self, obj: Question) -> str:
+        if len(obj.text) <= 80:
+            return obj.text
+        return obj.text[:77] + "…"
+
+
+@admin.register(Answer)
+class AnswerAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "question_id",
+        "confidence",
+        "model_name",
+        "latency_ms",
+        "has_error",
+        "created_at",
+    )
+    search_fields = ("text", "error", "model_name")
+    ordering = ("-created_at",)
+    readonly_fields = (
+        "question",
+        "text",
+        "raw_llm_output",
+        "confidence",
+        "sources_json",
+        "model_name",
+        "latency_ms",
+        "error",
+        "created_at",
+    )
+
+    @admin.display(boolean=True, description="error")
+    def has_error(self, obj: Answer) -> bool:
+        return bool(obj.error)
+

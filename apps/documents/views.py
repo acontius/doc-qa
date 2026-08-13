@@ -14,7 +14,7 @@ from rest_framework.parsers import (
 from rest_framework.response import Response
 from rest_framework.decorators import action
 
-from .models import Document
+from .models import Document, Question
 from .serializers import (
     DocumentDetailSerializer,
     DocumentListSerializer,
@@ -23,12 +23,15 @@ from .serializers import (
     RetrievalResponseSerializer,
     QuestionRequestSerializer,
     QuestionResponseSerializer,
+    QuestionListSerializer,
+    QuestionDetailSerializer,
 )
 from .services import (
     DocumentIngestionError,
     DocumentRetrievalError,
     RAGError,
     answer_question,
+    ask_and_persist_question,
     create_document,
     delete_document,
     reindex_document,
@@ -431,30 +434,37 @@ class RetrievalView(APIView):
         return Response(payload, status=status.HTTP_200_OK)
 
 
+class QuestionViewSet(viewsets.GenericViewSet):
+    """
+    Ask grounded questions (with history) and browse past Q&A.
+    """
 
-class QuestionView(APIView):
-    """
-    Grounded document Q&A using retrieval + OpenRouter LLM.
-    """
+    queryset = Question.objects.select_related("answer").all()
+
+    def get_serializer_class(self):
+        if self.action == "create":
+            return QuestionRequestSerializer
+        if self.action == "list":
+            return QuestionListSerializer
+        return QuestionDetailSerializer
+
 
     @extend_schema(
         summary="Ask a grounded question",
         description=(
-            "Retrieve relevant chunks, build controlled context, "
-            "call the configured LLM, and return answer + sources. "
-            "Does not invent facts outside retrieved documents."
+            "Retrieve relevant chunks, call the LLM, persist Question/Answer "
+            "history, and return a grounded response."
         ),
         request=QuestionRequestSerializer,
         responses={200: QuestionResponseSerializer},
     )
-    def post(self, request, *args, **kwargs):
+    def create(self, request, *args, **kwargs):
         serializer = QuestionRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-
         data = serializer.validated_data
 
         try:
-            result = answer_question(
+            question_row, result = ask_and_persist_question(
                 data["question"],
                 top_k=data.get("top_k"),
                 document_ids=data.get("document_ids"),
@@ -473,11 +483,7 @@ class QuestionView(APIView):
                 {
                     "error": {
                         "code": code,
-                        "message": getattr(
-                            exc,
-                            "message",
-                            str(exc),
-                        ),
+                        "message": getattr(exc, "message", str(exc)),
                     }
                 },
                 status=status_code,
@@ -495,6 +501,7 @@ class QuestionView(APIView):
             )
 
         payload = {
+            "id": question_row.id,
             "question": result.question,
             "answer": result.answer,
             "sources": [
@@ -509,6 +516,38 @@ class QuestionView(APIView):
             "confidence": result.confidence,
             "latency_ms": result.latency_ms,
         }
-
         return Response(payload, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        summary="List question history",
+        responses=QuestionListSerializer(many=True),
+    )
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = QuestionListSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = QuestionListSerializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @extend_schema(
+        summary="Get question history detail",
+        responses=QuestionDetailSerializer,
+    )
+    def retrieve(self, request, *args, **kwargs):
+        try:
+            instance = self.get_queryset().get(pk=kwargs.get("pk"))
+        except Question.DoesNotExist:
+            return Response(
+                {
+                    "error": {
+                        "code": "question_not_found",
+                        "message": "سؤال موردنظر یافت نشد.",
+                    }
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        serializer = QuestionDetailSerializer(instance)
+        return Response(serializer.data)
 

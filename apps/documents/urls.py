@@ -1,7 +1,7 @@
 from django.urls import path
 from rest_framework.routers import DefaultRouter
 
-from .views import DocumentViewSet, QuestionView, RetrievalView
+from .views import DocumentViewSet, QuestionViewSet, RetrievalView
 
 
 router = DefaultRouter()
@@ -12,15 +12,16 @@ router.register(
     basename="document",
 )
 
+router.register(
+    "questions",
+    QuestionViewSet,
+    basename="question",
+)
+
 urlpatterns = [
     path(
         "retrieval/",
         RetrievalView.as_view(),
         name="retrieval",
-    ),
-    path(
-        "questions/",
-        QuestionView.as_view(),
-        name="questions",
     ),
 ] + router.urls

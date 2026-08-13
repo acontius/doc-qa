@@ -947,6 +947,7 @@ class AnswerSource:
     document_title: str
     chunk_index: int
     excerpt: str
+    score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -956,6 +957,8 @@ class QAResult:
     sources: list[AnswerSource]
     confidence: str
     latency_ms: int
+    raw_llm_output: str = ""
+    model_name: str = ""
 
 
 def is_llm_configured() -> bool:
@@ -1141,6 +1144,7 @@ def parse_llm_response(
                     document_title=title.strip(),
                     chunk_index=chunk_index,
                     excerpt=excerpt,
+                    score=float(retrieved_chunk.final_score),
                 )
             )
 
@@ -1210,6 +1214,8 @@ def answer_question(
             sources=[],
             confidence="low",
             latency_ms=latency_ms,
+            raw_llm_output="",
+            model_name="",
         )
 
     context = build_rag_context(retrieved)
@@ -1269,5 +1275,81 @@ def answer_question(
         sources=sources,
         confidence=confidence,
         latency_ms=latency_ms,
+        raw_llm_output=raw,
+        model_name=settings.OPENROUTER_MODEL or "",
     )
 
+
+def _sources_to_json(sources: list[AnswerSource]) -> list[dict]:
+    payload: list[dict] = []
+    for src in sources:
+        item = {
+            "document_id": src.document_id,
+            "document_title": src.document_title,
+            "chunk_index": src.chunk_index,
+            "excerpt": src.excerpt[:SOURCE_EXCERPT_MAX_LEN],
+        }
+        if src.score is not None:
+            item["score"] = src.score
+        payload.append(item)
+    return payload
+
+
+def ask_and_persist_question(
+    question: str,
+    *,
+    top_k: int | None = None,
+    document_ids: list[int] | None = None,
+) -> tuple["Question", QAResult]:
+    """
+    Persist Question, run existing RAG pipeline, persist Answer.
+
+    LLM network calls are outside long DB transactions.
+    On RAGError, Question + error Answer are kept, then the error is re-raised.
+    """
+    from .models import Answer, Question
+
+    # Validate before persisting so bad requests leave no history.
+    question, effective_top_k, document_ids = _validate_retrieval_inputs(
+        question,
+        top_k,
+        document_ids,
+    )
+
+    question_row = Question.objects.create(
+        text=question,
+        top_k=effective_top_k,
+        document_ids=document_ids,
+    )
+
+    try:
+        result = answer_question(
+            question,
+            top_k=top_k,
+            document_ids=document_ids,
+        )
+    except RAGError as exc:
+        Answer.objects.create(
+            question=question_row,
+            text="",
+            raw_llm_output="",
+            confidence="low",
+            sources_json=[],
+            model_name=settings.OPENROUTER_MODEL or "",
+            latency_ms=0,
+            error=f"{exc.code}: {exc.message}",
+        )
+        raise
+
+    Answer.objects.create(
+        question=question_row,
+        text=result.answer,
+        raw_llm_output=result.raw_llm_output,
+        confidence=result.confidence,
+        sources_json=_sources_to_json(result.sources),
+        model_name=result.model_name or (settings.OPENROUTER_MODEL or ""),
+        latency_ms=result.latency_ms,
+        error="",
+    )
+
+    return question_row, result

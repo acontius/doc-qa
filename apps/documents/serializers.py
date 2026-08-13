@@ -2,7 +2,7 @@ from pathlib import Path
 
 from rest_framework import serializers
 
-from .models import Document
+from .models import Document, Question
 from .services import (
     DocumentIngestionError,
     validate_docx_upload,
@@ -184,4 +184,90 @@ class QuestionResponseSerializer(serializers.Serializer):
         choices=["low", "medium", "high"],
     )
     latency_ms = serializers.IntegerField()
+
+
+class QuestionListSerializer(serializers.ModelSerializer):
+    question = serializers.CharField(source="text")
+    answer_preview = serializers.SerializerMethodField()
+    confidence = serializers.SerializerMethodField()
+    model_name = serializers.SerializerMethodField()
+    latency_ms = serializers.SerializerMethodField()
+    has_error = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Question
+        fields = [
+            "id",
+            "question",
+            "answer_preview",
+            "confidence",
+            "model_name",
+            "latency_ms",
+            "has_error",
+            "created_at",
+        ]
+
+    def get_answer_preview(self, obj) -> str:
+        answer = getattr(obj, "answer", None)
+        if answer is None:
+            return ""
+        if answer.error and not answer.text:
+            return ""
+        preview = (answer.text or "")[:160]
+        if len(answer.text or "") > 160:
+            preview += "…"
+        return preview
+
+    def get_confidence(self, obj) -> str | None:
+        answer = getattr(obj, "answer", None)
+        if answer is None:
+            return None
+        return answer.confidence
+
+    def get_model_name(self, obj) -> str | None:
+        answer = getattr(obj, "answer", None)
+        if answer is None:
+            return None
+        return answer.model_name or None
+
+    def get_latency_ms(self, obj) -> int | None:
+        answer = getattr(obj, "answer", None)
+        if answer is None:
+            return None
+        return answer.latency_ms
+
+    def get_has_error(self, obj) -> bool:
+        answer = getattr(obj, "answer", None)
+        if answer is None:
+            return False
+        return bool(answer.error)
+
+
+class QuestionDetailSerializer(serializers.ModelSerializer):
+    question = serializers.CharField(source="text")
+    answer = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Question
+        fields = [
+            "id",
+            "question",
+            "top_k",
+            "document_ids",
+            "created_at",
+            "answer",
+        ]
+
+    def get_answer(self, obj) -> dict | None:
+        ans = getattr(obj, "answer", None)
+        if ans is None:
+            return None
+        return {
+            "text": ans.text,
+            "confidence": ans.confidence,
+            "sources": ans.sources_json or [],
+            "model_name": ans.model_name,
+            "latency_ms": ans.latency_ms,
+            "error": ans.error or None,
+        }
 

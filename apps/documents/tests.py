@@ -24,7 +24,7 @@ from django.test import (
 from docx import Document as DocxDocument
 from rest_framework import status
 
-from .models import Document, DocumentChunk
+from .models import Answer, Document, DocumentChunk, Question
 from .services import (
     DocumentIngestionError,
     DocumentRetrievalError,
@@ -43,6 +43,7 @@ from .services import (
     update_document,
     validate_docx_upload,
     answer_question,
+    ask_and_persist_question,
     build_rag_context,
     get_chat_model,
     is_llm_configured,
@@ -2175,4 +2176,269 @@ class QuestionAPITests(
             response.status_code,
             status.HTTP_400_BAD_REQUEST,
         )
+
+
+
+class QuestionHistoryServiceTests(
+    DocumentTestMixin,
+    TemporaryMediaMixin,
+    TestCase,
+):
+    def tearDown(self):
+        get_chat_model.cache_clear()
+        super().tearDown()
+
+    def test_successful_qa_persists_question_and_answer(self):
+        with self.mocked_embedding_service(value=0.02):
+            content = self.make_docx(
+                paragraphs=["مرخصی کارکنان سالانه بیست روز است. " * 20],
+            )
+            doc = create_document(
+                title="Leave",
+                uploaded_file=self.make_upload(content),
+            )
+
+            mock_model = Mock()
+            mock_response = Mock()
+            mock_response.content = (
+                '{"answer": "بیست روز", "sources": [{'
+                f'"document_id": {doc.id}, '
+                '"document_title": "Leave", "chunk_index": 0, '
+                '"excerpt": "مرخصی کارکنان سالانه بیست روز است."'
+                '}], "confidence": "high"}'
+            )
+            mock_model.invoke.return_value = mock_response
+
+            with patch(
+                "apps.documents.services.get_chat_model",
+                return_value=mock_model,
+            ):
+                question_row, result = ask_and_persist_question(
+                    "میزان مرخصی چقدر است؟",
+                    top_k=3,
+                    document_ids=[doc.id],
+                )
+
+        self.assertEqual(Question.objects.count(), 1)
+        self.assertEqual(Answer.objects.count(), 1)
+        self.assertEqual(question_row.text, "میزان مرخصی چقدر است؟")
+        self.assertEqual(question_row.top_k, 3)
+        self.assertEqual(question_row.document_ids, [doc.id])
+
+        answer = question_row.answer
+        self.assertEqual(answer.text, "بیست روز")
+        self.assertEqual(answer.confidence, "high")
+        self.assertFalse(answer.error)
+        self.assertTrue(answer.sources_json)
+        self.assertLessEqual(
+            len(answer.sources_json[0].get("excerpt", "")),
+            250,
+        )
+        self.assertEqual(result.answer, "بیست روز")
+
+    def test_llm_failure_keeps_question_and_error_answer(self):
+        with self.mocked_embedding_service(value=0.02):
+            content = self.make_docx(
+                paragraphs=["متن نمونه برای خطا. " * 20],
+            )
+            create_document(
+                title="X",
+                uploaded_file=self.make_upload(content),
+            )
+
+            mock_model = Mock()
+            mock_model.invoke.side_effect = RuntimeError("timeout")
+
+            with patch(
+                "apps.documents.services.get_chat_model",
+                return_value=mock_model,
+            ):
+                with self.assertRaises(RAGError):
+                    ask_and_persist_question(
+                        "متن نمونه چیست؟",
+                        top_k=2,
+                    )
+
+        self.assertEqual(Question.objects.count(), 1)
+        self.assertEqual(Answer.objects.count(), 1)
+        answer = Answer.objects.get()
+        self.assertTrue(answer.error)
+        self.assertEqual(answer.confidence, "low")
+        self.assertEqual(answer.text, "")
+
+    def test_validation_does_not_create_history(self):
+        with self.assertRaises(DocumentRetrievalError):
+            ask_and_persist_question("   ")
+
+        self.assertEqual(Question.objects.count(), 0)
+        self.assertEqual(Answer.objects.count(), 0)
+
+
+class QuestionHistoryAPITests(
+    DocumentTestMixin,
+    TemporaryMediaMixin,
+    APITestCase,
+):
+    def setUp(self):
+        self.client = APIClient()
+
+    def tearDown(self):
+        get_chat_model.cache_clear()
+        super().tearDown()
+
+    def test_post_creates_history(self):
+        with self.mocked_embedding_service(value=0.02):
+            content = self.make_docx(
+                paragraphs=["ساعات کاری از هشت تا چهار است. " * 20],
+            )
+            create_response = self.client.post(
+                "/api/documents/",
+                {
+                    "title": "Hours",
+                    "file": self.make_upload(content),
+                },
+                format="multipart",
+            )
+            doc_id = create_response.data["id"]
+
+            mock_model = Mock()
+            mock_response = Mock()
+            mock_response.content = (
+                '{"answer": "از هشت تا چهار", "sources": [{'
+                f'"document_id": {doc_id}, '
+                '"document_title": "Hours", "chunk_index": 0, '
+                '"excerpt": "ساعات کاری از هشت تا چهار است."'
+                '}], "confidence": "medium"}'
+            )
+            mock_model.invoke.return_value = mock_response
+
+            with patch(
+                "apps.documents.services.get_chat_model",
+                return_value=mock_model,
+            ):
+                response = self.client.post(
+                    "/api/questions/",
+                    {
+                        "question": "ساعات کاری چیست؟",
+                        "top_k": 3,
+                        "document_ids": [doc_id],
+                    },
+                    format="json",
+                )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("id", response.data)
+        self.assertEqual(Question.objects.count(), 1)
+        self.assertEqual(Answer.objects.count(), 1)
+        q = Question.objects.get()
+        self.assertEqual(q.document_ids, [doc_id])
+        self.assertEqual(q.top_k, 3)
+
+    def test_list_history(self):
+        Question.objects.create(text="q1", top_k=6)
+        Question.objects.create(text="q2", top_k=6)
+
+        response = self.client.get("/api/questions/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("results", response.data)
+        self.assertEqual(len(response.data["results"]), 2)
+        # newest first
+        self.assertEqual(
+            response.data["results"][0]["question"],
+            "q2",
+        )
+
+    def test_detail_history(self):
+        q = Question.objects.create(
+            text="detail question",
+            top_k=4,
+            document_ids=[1, 2],
+        )
+        Answer.objects.create(
+            question=q,
+            text="detail answer",
+            confidence="high",
+            sources_json=[
+                {
+                    "document_id": 1,
+                    "document_title": "D",
+                    "chunk_index": 0,
+                    "excerpt": "ex",
+                }
+            ],
+            model_name="test-model",
+            latency_ms=100,
+        )
+
+        response = self.client.get(f"/api/questions/{q.id}/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["question"], "detail question")
+        self.assertEqual(response.data["top_k"], 4)
+        self.assertEqual(response.data["document_ids"], [1, 2])
+        self.assertEqual(response.data["answer"]["text"], "detail answer")
+        self.assertEqual(response.data["answer"]["confidence"], "high")
+
+    def test_detail_not_found(self):
+        response = self.client.get("/api/questions/999999/")
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        self.assertEqual(
+            response.data["error"]["code"],
+            "question_not_found",
+        )
+
+    def test_post_validation_no_history(self):
+        response = self.client.post(
+            "/api/questions/",
+            {"question": "  "},
+            format="json",
+        )
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertEqual(Question.objects.count(), 0)
+
+    def test_llm_failure_http_503_with_history(self):
+        with self.mocked_embedding_service(value=0.02):
+            content = self.make_docx(
+                paragraphs=["متن. " * 30],
+            )
+            self.client.post(
+                "/api/documents/",
+                {
+                    "title": "Doc",
+                    "file": self.make_upload(content),
+                },
+                format="multipart",
+            )
+
+            mock_model = Mock()
+            mock_model.invoke.side_effect = RuntimeError("down")
+
+            with patch(
+                "apps.documents.services.get_chat_model",
+                return_value=mock_model,
+            ):
+                response = self.client.post(
+                    "/api/questions/",
+                    {"question": "متن چیست؟"},
+                    format="json",
+                )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+        self.assertEqual(Question.objects.count(), 1)
+        self.assertEqual(Answer.objects.count(), 1)
+        self.assertTrue(Answer.objects.get().error)
+
+
+class QuestionAdminRegistrationTests(TestCase):
+    def test_question_and_answer_registered(self):
+        from django.contrib import admin as dj_admin
+        from .models import Answer, Question
+
+        self.assertTrue(dj_admin.site.is_registered(Question))
+        self.assertTrue(dj_admin.site.is_registered(Answer))
 
