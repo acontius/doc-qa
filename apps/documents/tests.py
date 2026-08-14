@@ -14,6 +14,7 @@ from rest_framework.test import (
 import numpy as np
 
 from django.conf import settings
+from django.core.management import call_command
 from django.core.files.storage import default_storage
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
@@ -2514,4 +2515,68 @@ class APIDocumentationTests(APITestCase):
         self.assertIn("/api/questions/", path_keys)
         self.assertIn("/api/retrieval/", path_keys)
         self.assertIn("/api/health/", path_keys)
+
+
+class SampleDataCommandTests(
+    DocumentTestMixin,
+    TemporaryMediaMixin,
+    TestCase,
+):
+    """
+    create_sample_data must use the real ingestion pipeline and be idempotent.
+    Embeddings are mocked so the default suite stays offline/deterministic.
+    """
+
+    def test_creates_sample_documents_with_chunks(self):
+        with self.mocked_embedding_service(value=0.03):
+            call_command("create_sample_data")
+
+        documents = Document.objects.order_by("id")
+        self.assertEqual(documents.count(), 3)
+
+        for document in documents:
+            self.assertTrue(document.full_text.strip())
+            self.assertGreater(document.chunk_count, 0)
+            self.assertEqual(
+                document.chunks.count(),
+                document.chunk_count,
+            )
+            self.assertTrue(document.file.name)
+
+        titles = set(documents.values_list("title", flat=True))
+        self.assertIn("راهنمای منابع انسانی (نمونه)", titles)
+        self.assertIn("راهنمای فنی سیستم (نمونه)", titles)
+        self.assertIn("راهنمای شرکت (نمونه)", titles)
+
+        # Distinct facts usable for manual retrieval checks.
+        hr = Document.objects.get(title="راهنمای منابع انسانی (نمونه)")
+        self.assertIn("۲۶", hr.full_text)
+
+        tech = Document.objects.get(title="راهنمای فنی سیستم (نمونه)")
+        self.assertIn("PostgreSQL", tech.full_text)
+
+    def test_command_is_idempotent_by_title(self):
+        with self.mocked_embedding_service(value=0.03):
+            call_command("create_sample_data")
+            call_command("create_sample_data")
+
+        self.assertEqual(Document.objects.count(), 3)
+
+    def test_force_recreates_sample_documents(self):
+        with self.mocked_embedding_service(value=0.03):
+            call_command("create_sample_data")
+            first_ids = list(
+                Document.objects.order_by("title").values_list(
+                    "id", flat=True
+                )
+            )
+            call_command("create_sample_data", force=True)
+            second_ids = list(
+                Document.objects.order_by("title").values_list(
+                    "id", flat=True
+                )
+            )
+
+        self.assertEqual(Document.objects.count(), 3)
+        self.assertNotEqual(first_ids, second_ids)
 
