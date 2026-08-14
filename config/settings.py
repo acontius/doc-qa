@@ -178,7 +178,7 @@ SPECTACULAR_SETTINGS = {
         "Errors use:\n"
         '{ "error": { "code": "...", "message": "...", "details": {} } }'
     ),
-    "VERSION": "0.2.0",
+    "VERSION": "1.0.0",
     "SERVE_INCLUDE_SCHEMA": False,
     "COMPONENT_SPLIT_REQUEST": True,
     "TAGS": [
@@ -242,6 +242,4 @@ RETRIEVER_CANDIDATE_MULTIPLIER = int(
 MAX_UPLOAD_SIZE_MB = int(
     os.getenv("MAX_UPLOAD_SIZE_MB", "10")
 )
-
-MEDIA_ROOT = BASE_DIR / "media"
 MEDIA_URL = "/media/"
