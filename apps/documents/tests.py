@@ -14,6 +14,8 @@ from rest_framework.test import (
 import numpy as np
 
 from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.urls import reverse
 from django.core.management import call_command
 from django.core.files.storage import default_storage
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -2579,4 +2581,194 @@ class SampleDataCommandTests(
 
         self.assertEqual(Document.objects.count(), 3)
         self.assertNotEqual(first_ids, second_ids)
+
+
+class DocumentAdminListTests(TestCase):
+    def test_document_changelist_includes_id_column(self):
+        from django.contrib import admin as dj_admin
+        from .admin import DocumentAdmin
+
+        model_admin = DocumentAdmin(Document, dj_admin.site)
+        self.assertIn("id", model_admin.list_display)
+
+
+class QuestionAdminWorkflowTests(
+    DocumentTestMixin,
+    TemporaryMediaMixin,
+    TestCase,
+):
+    """
+    Admin Add Question must call ask_and_persist_question (same as API).
+
+    POST must include `_save`. AnswerInline is disabled on add.
+    """
+
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_superuser(
+            username="admin",
+            email="admin@example.com",
+            password="admin-pass-123",
+        )
+        self.client.force_login(self.user)
+
+    def tearDown(self):
+        get_chat_model.cache_clear()
+        super().tearDown()
+
+    def _add_payload(self, **fields) -> dict:
+        payload = {
+            "text": fields.get("text", ""),
+            "top_k": fields.get("top_k", ""),
+            "_save": "Save",
+        }
+        documents = fields.get("documents")
+        if documents is not None:
+            payload["documents"] = documents
+        return payload
+
+    def test_add_question_form_renders(self):
+        response = self.client.get(
+            reverse("admin:documents_question_add"),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'name="text"')
+        self.assertContains(response, "سؤال")
+        self.assertContains(response, "top_k")
+        self.assertContains(response, "documents")
+
+    def test_empty_question_rejected(self):
+        response = self.client.post(
+            reverse("admin:documents_question_add"),
+            self._add_payload(text="   ", top_k=""),
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Question.objects.count(), 0)
+        self.assertEqual(Answer.objects.count(), 0)
+
+    def test_admin_submit_creates_question_and_answer(self):
+        with self.mocked_embedding_service(value=0.02):
+            content = self.make_docx(
+                paragraphs=["مرخصی کارکنان سالانه بیست روز است. " * 20],
+            )
+            doc = create_document(
+                title="Leave Policy",
+                uploaded_file=self.make_upload(content),
+            )
+
+            mock_model = Mock()
+            mock_response = Mock()
+            mock_response.content = (
+                '{"answer": "بیست روز", "sources": [{'
+                f'"document_id": {doc.id}, '
+                '"document_title": "Leave Policy", "chunk_index": 0, '
+                '"excerpt": "مرخصی کارکنان سالانه بیست روز است."'
+                '}], "confidence": "high"}'
+            )
+            mock_model.invoke.return_value = mock_response
+
+            with patch(
+                "apps.documents.services.get_chat_model",
+                return_value=mock_model,
+            ):
+                response = self.client.post(
+                    reverse("admin:documents_question_add"),
+                    self._add_payload(
+                        text="میزان مرخصی سالانه چقدر است؟",
+                        top_k="3",
+                        documents=[str(doc.id)],
+                    ),
+                    follow=False,
+                )
+
+        self.assertEqual(
+            response.status_code,
+            302,
+            msg=f"expected redirect; body={response.content[:400]!r}",
+        )
+        self.assertEqual(Question.objects.count(), 1)
+        self.assertEqual(Answer.objects.count(), 1)
+
+        question = Question.objects.get()
+        self.assertEqual(question.text, "میزان مرخصی سالانه چقدر است؟")
+        self.assertEqual(question.top_k, 3)
+        self.assertEqual(question.document_ids, [doc.id])
+
+        answer = question.answer
+        self.assertEqual(answer.text, "بیست روز")
+        self.assertEqual(answer.confidence, "high")
+        self.assertFalse(answer.error)
+        self.assertTrue(answer.sources_json)
+        mock_model.invoke.assert_called_once()
+
+    def test_admin_llm_failure_keeps_history(self):
+        with self.mocked_embedding_service(value=0.02):
+            content = self.make_docx(
+                paragraphs=["متن نمونه برای خطا. " * 20],
+            )
+            create_document(
+                title="X",
+                uploaded_file=self.make_upload(content),
+            )
+
+            mock_model = Mock()
+            mock_model.invoke.side_effect = RuntimeError("timeout")
+
+            with patch(
+                "apps.documents.services.get_chat_model",
+                return_value=mock_model,
+            ):
+                response = self.client.post(
+                    reverse("admin:documents_question_add"),
+                    self._add_payload(
+                        text="متن نمونه چیست؟",
+                        top_k="2",
+                    ),
+                    follow=False,
+                )
+
+        self.assertIn(response.status_code, (200, 302))
+        self.assertEqual(Question.objects.count(), 1)
+        self.assertEqual(Answer.objects.count(), 1)
+        self.assertTrue(Answer.objects.get().error)
+
+    def test_admin_all_documents_when_none_selected(self):
+        with self.mocked_embedding_service(value=0.02):
+            content = self.make_docx(
+                paragraphs=["ساعات کاری از هشت تا چهار است. " * 20],
+            )
+            create_document(
+                title="Hours",
+                uploaded_file=self.make_upload(content),
+            )
+
+            mock_model = Mock()
+            mock_response = Mock()
+            mock_response.content = (
+                '{"answer": "از هشت تا چهار", "sources": [], '
+                '"confidence": "medium"}'
+            )
+            mock_model.invoke.return_value = mock_response
+
+            with patch(
+                "apps.documents.services.get_chat_model",
+                return_value=mock_model,
+            ):
+                response = self.client.post(
+                    reverse("admin:documents_question_add"),
+                    self._add_payload(
+                        text="ساعات کاری چیست؟",
+                        top_k="",
+                    ),
+                    follow=False,
+                )
+
+        self.assertEqual(
+            response.status_code,
+            302,
+            msg=f"expected redirect; body={response.content[:400]!r}",
+        )
+        question = Question.objects.get()
+        self.assertIsNone(question.document_ids)
+        self.assertEqual(question.top_k, settings.RETRIEVER_TOP_K)
 

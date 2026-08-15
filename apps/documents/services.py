@@ -1339,6 +1339,8 @@ def ask_and_persist_question(
             latency_ms=0,
             error=f"{exc.code}: {exc.message}",
         )
+        # Admin can attach the already-persisted history row.
+        exc.persisted_question = question_row
         raise
 
     Answer.objects.create(
